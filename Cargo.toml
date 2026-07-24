@@ -1,0 +1,14 @@
+[package]
+name = "atome" # Must be unique across all of crates.io
+version = "0.1.0"
+edition = "2021"
+authors = ["Jonathan Stoff <JonathanLStoff@gmail.com>"]
+
+
+description = "An async, `cpal`-based audio engine for Rust. `atome` gives you a small, composable API for building real-time audio applications — sample playback, mixing, routing, and DSP graphs — without wrestling with platform audio callbacks, device enumeration, or buffer management yourself."
+license = "MIT"
+repository = "https://github.com/jonathanlstoff/atome"
+readme = "README.md"
+
+keywords = ["audio", "async", "engine", "samples", "decode"]
+categories = ["Multimedia", "Encoding"] 
