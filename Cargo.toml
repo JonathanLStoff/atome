@@ -12,3 +12,8 @@ readme = "README.md"
 
 keywords = ["audio", "async", "engine", "samples", "decode"]
 categories = ["Multimedia", "Encoding"] 
+
+[dependencies]
+atomic-queue = "2.2.0"
+cpal = "0.18.1"
+ringbuf = "0.5.1"
