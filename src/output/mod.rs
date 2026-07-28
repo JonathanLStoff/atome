@@ -1,31 +1,44 @@
 use cpal::traits::DeviceTrait;
-use cpal::{Device, Error, ErrorKind, SampleFormat, Stream, StreamConfig};
+use cpal::{Data, Device, Error, ErrorKind, SampleFormat, Stream, StreamConfig};
 use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 
+
 pub mod types;
+pub mod utils;
 
 pub use types::{OutputType, SampleRate, SampleType};
+pub use utils::{default_device, find_device, list_device_names, list_devices, device_name};
+
+/// Frames assumed when the caller asks for the device's default buffer size.
+/// Only used to size the ring buffer — the stream itself still asks the device
+/// for its own preferred size.
+const DEFAULT_BUFFER_FRAMES: i32 = 1024;
 
 /// # OutputClass
-/// 
+///
 /// Used to hold a stream to a single output
 
 pub struct OutputClass {
     // Number of channels in this output
-    channels: i32,
-    // String name of device
-    name: String,
+    channels: u16,
+    // Output device to use
+    device: Device,
     // Type of device
     out_type: OutputType,
-    // The buffer size, one for all outputs
-    buffer_size: i32,
+    // The buffer size in frames, one for all outputs; `None` = device default
+    buffer_size: Option<i32>,
     // The sample rate
     sample_rate: SampleRate,
-    // The sample type options: [i8, i16, i24, i32, i64, u8, u16, u24, u32, u64, F32, F64, DsdU8, DsdU16, DsdU32]
-    sample_format: SampleFormat,
+    // The runtime tag for the sample type: [i8, i16, i24, i32, i64, u8, u16, u24, u32, u64, F32, F64, DsdU8, DsdU16, DsdU32].
+    // `SampleType` is a trait, so it can only bound a generic parameter, never
+    // be a field; `SampleFormat` is its value-level counterpart, and
+    // `S::format()` maps one to the other.
+    sample_type: SampleFormat,
     // stream for cpal
     stream: Option<Stream>,
+    // Config the stream is (or will be) built with
+    stream_config: StreamConfig,
     // Producer half of the ring buffer: `add_samples` writes here
     producer: HeapProd<f32>,
     // Consumer half: taken by `build_stream` and moved into the audio callback
@@ -33,147 +46,188 @@ pub struct OutputClass {
 }
 
 impl OutputClass {
-    pub fn new(name: String, out_type: OutputType, channels: i32, sample_rate:SampleRate, sample_format: SampleFormat, buffer_size: i32) -> Self {
+    pub fn new(device: Option<Device>, out_type: OutputType, channels: u16, sample_rate:SampleRate, sample_type: SampleFormat, buffer_size: Option<i32>) -> Self {
+        // `None` lets the device pick its own buffer size. We can't know that
+        // size until the stream is built, so the ring buffer is sized off a
+        // default instead.
+        let buffer_size_form = match buffer_size {
+            Some(frames) => cpal::BufferSize::Fixed(frames as u32),
+            None => cpal::BufferSize::Default,
+        };
+        let frames = buffer_size.unwrap_or(DEFAULT_BUFFER_FRAMES).max(1) as usize;
+        
+        
+        let stream_config = StreamConfig {
+            channels,
+            sample_rate: sample_rate as u32,
+            buffer_size: buffer_size_form,
+        };
+
         // Room for a few callback periods so a late producer does not underrun.
-        let capacity = buffer_size.max(1) as usize * channels.max(1) as usize * 4;
+        let capacity = frames * channels.max(1) as usize * 4;
         let (producer, consumer) = HeapRb::<f32>::new(capacity).split();
 
         OutputClass {
             channels,
-            name,
+            device: device
+                .unwrap_or_else(|| default_device().expect("no default output device available")),
             out_type,
             buffer_size,
             sample_rate,
-            sample_format,
+            sample_type,
             stream: None,
+            stream_config,
             producer,
             consumer: Some(consumer),
         }
     }
 
-    pub fn channels(&self) -> i32 {
+    pub fn channels(&self) -> u16 {
         self.channels
     }
+    pub fn device(&self) -> Device {
+        self.device.clone()
+    }  
     pub fn name(&self) -> String {
-        self.name.clone()
+        device_name(&self.device)
     }
-    pub fn buffer_size(&self) -> i32 {
+    /// The configured buffer size in frames, or `None` if the device picks it.
+    pub fn buffer_size(&self) -> Option<i32> {
         self.buffer_size
     }
     pub fn sample_rate(&self) -> i32 {
         self.sample_rate as i32
     }
     pub fn sample_format(&self) -> SampleFormat {
-        self.sample_format
+        self.sample_type
+    }
+
+    pub fn sample_type(&self) -> SampleFormat {
+        self.sample_type
     }
     pub fn out_type(&self) -> OutputType {
         self.out_type
     }
+    /// The body of the output callback, generic over the device's sample type.
+    ///
+    /// Pops one callback's worth of interleaved samples out of the ring buffer
+    /// and hands them to the host as `S`. `add_samples` already writes frames
+    /// interleaved (L,R,L,R,…), so popping a contiguous run preserves that
+    /// layout — the samples go out in exactly the order they came in.
+    ///
+    /// `scratch` is owned by the caller and reused across calls so the callback
+    /// never allocates on the audio thread.
+    fn data_callback<S: SampleType>(
+        data: &mut Data,
+        buffer: &mut HeapCons<f32>,
+        scratch: &mut Vec<f32>,
+    ) {
+        let data = data
+            .as_slice_mut::<S>()
+            .expect("host supplied a buffer of a different sample type");
 
-    /// Builds the cpal output stream for `device`, pulling mixed samples out of
-    /// this output's ring buffer and writing them in whatever sample format the
-    /// device requires. The resulting `Stream` is stored on `self` (streams must
-    /// be kept alive to keep playing) and also returned.
+        // The ring buffer holds f32, so pop into scratch and convert on the way
+        // out. `resize` only ever allocates on the first few callbacks.
+        if scratch.len() < data.len() {
+            scratch.resize(data.len(), 0.0);
+        }
+        let frames = &mut scratch[..data.len()];
+
+        let read = buffer.pop_slice(frames);
+        if read < frames.len() {
+            // Underrun: pad with silence rather than replaying stale audio.
+            frames[read..].fill(0.0);
+        }
+
+        for (dst, sample) in data.iter_mut().zip(frames.iter()) {
+            *dst = S::from_f32(sample.clamp(-1.0, 1.0));
+        }
+    }
+
+    /// Builds the cpal output stream for this output's device, pulling mixed
+    /// samples out of its ring buffer and writing them in whatever sample format
+    /// the device requires. The resulting `Stream` is stored on `self` (streams
+    /// must be kept alive to keep playing) and also returned.
     ///
     /// Consumes the consumer half of the ring buffer, so it can only be called
     /// once per `OutputClass`.
-    pub fn build_stream(
-        &mut self,
-        device: &Device,
-        sample_format: SampleFormat,
-    ) -> Result<&Stream, Error> {
-        let buffer = self.consumer.take().ok_or_else(|| {
+    pub fn build_stream(&mut self) -> Result<&Stream, Error> {
+        // Checked before taking the consumer, so a rejected format leaves the
+        // output still buildable.
+        if matches!(
+            self.sample_type,
+            SampleFormat::DsdU8 | SampleFormat::DsdU16 | SampleFormat::DsdU32
+        ) {
+            // DSD is a 1-bit bitstream, not PCM — nothing to convert f32 into.
+            return Err(Error::with_message(
+                ErrorKind::UnsupportedConfig,
+                "DSD output is not supported",
+            ));
+        }
+
+        let mut buffer = self.consumer.take().ok_or_else(|| {
             Error::with_message(
                 ErrorKind::UnsupportedOperation,
                 "stream already built for this output",
             )
         })?;
 
-        let stream_config = StreamConfig {
-            channels: self.channels as u16,
-            sample_rate: device.default_output_config()?.sample_rate(),
-            buffer_size: cpal::BufferSize::Fixed(self.buffer_size as u32),
-        };
-
-        let stream = match sample_format {
-            SampleFormat::I8 => Self::typed_stream::<i8>(device, stream_config, buffer)?,
-            SampleFormat::I16 => Self::typed_stream::<i16>(device, stream_config, buffer)?,
-            SampleFormat::I24 => Self::typed_stream::<cpal::I24>(device, stream_config, buffer)?,
-            SampleFormat::I32 => Self::typed_stream::<i32>(device, stream_config, buffer)?,
-            SampleFormat::I64 => Self::typed_stream::<i64>(device, stream_config, buffer)?,
-            SampleFormat::U8 => Self::typed_stream::<u8>(device, stream_config, buffer)?,
-            SampleFormat::U16 => Self::typed_stream::<u16>(device, stream_config, buffer)?,
-            SampleFormat::U24 => Self::typed_stream::<cpal::U24>(device, stream_config, buffer)?,
-            SampleFormat::U32 => Self::typed_stream::<u32>(device, stream_config, buffer)?,
-            SampleFormat::U64 => Self::typed_stream::<u64>(device, stream_config, buffer)?,
-            SampleFormat::F64 => Self::typed_stream::<f64>(device, stream_config, buffer)?,
-            // f32 is the engine's own format, so the callback can read the ring
-            // buffer straight into the device buffer with no scratch copy.
-            SampleFormat::F32 => {
-                let mut buffer = buffer;
-                device.build_output_stream(
-                    stream_config,
-                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                        let read = buffer.pop_slice(data);
-                        if read < data.len() {
-                            data[read..].fill(0.0);
-                        }
-                    },
-                    Self::err_fn,
-                    None,
-                )?
-            }
-            // DSD is a 1-bit bitstream, not PCM — nothing to convert f32 into.
-            SampleFormat::DsdU8 | SampleFormat::DsdU16 | SampleFormat::DsdU32 => {
-                return Err(Error::with_message(
-                    ErrorKind::UnsupportedConfig,
-                    "DSD output is not supported",
-                ))
-            }
-            _ => return Err(Error::new(ErrorKind::UnsupportedConfig)),
-        };
-
-        self.stream = Some(stream);
-        Ok(self.stream.as_ref().unwrap())
-    }
-
-    /// One output callback, generic over the device's sample type: read `f32`
-    /// from the ring buffer, convert into `S` on the way out.
-    fn typed_stream<S: SampleType>(
-        device: &Device,
-        config: StreamConfig,
-        mut buffer: HeapCons<f32>,
-    ) -> Result<Stream, Error> {
+        let sample_type = self.sample_type;
         let mut scratch = Vec::<f32>::new();
-        device.build_output_stream(
-            config,
-            move |data: &mut [S], _: &cpal::OutputCallbackInfo| {
-                if scratch.len() < data.len() {
-                    scratch.resize(data.len(), 0.0);
+
+        // The raw API hands the callback an untyped `Data`, so the sample type
+        // is only known at runtime: dispatch once per callback to the right
+        // instantiation of `data_callback`.
+        let stream = self.device.build_output_stream_raw(
+            self.stream_config,
+            sample_type,
+            move |data: &mut Data, _: &cpal::OutputCallbackInfo| match sample_type {
+                SampleFormat::I8 => Self::data_callback::<i8>(data, &mut buffer, &mut scratch),
+                SampleFormat::I16 => Self::data_callback::<i16>(data, &mut buffer, &mut scratch),
+                SampleFormat::I24 => {
+                    Self::data_callback::<cpal::I24>(data, &mut buffer, &mut scratch)
                 }
-                let scratch = &mut scratch[..data.len()];
-                let read = buffer.pop_slice(scratch);
-                if read < scratch.len() {
-                    scratch[read..].fill(0.0);
+                SampleFormat::I32 => Self::data_callback::<i32>(data, &mut buffer, &mut scratch),
+                SampleFormat::I64 => Self::data_callback::<i64>(data, &mut buffer, &mut scratch),
+                SampleFormat::U8 => Self::data_callback::<u8>(data, &mut buffer, &mut scratch),
+                SampleFormat::U16 => Self::data_callback::<u16>(data, &mut buffer, &mut scratch),
+                SampleFormat::U24 => {
+                    Self::data_callback::<cpal::U24>(data, &mut buffer, &mut scratch)
                 }
-                for (dst, sample) in data.iter_mut().zip(scratch.iter()) {
-                    *dst = S::from_f32(sample.clamp(-1.0, 1.0));
-                }
+                SampleFormat::U32 => Self::data_callback::<u32>(data, &mut buffer, &mut scratch),
+                SampleFormat::U64 => Self::data_callback::<u64>(data, &mut buffer, &mut scratch),
+                SampleFormat::F32 => Self::data_callback::<f32>(data, &mut buffer, &mut scratch),
+                SampleFormat::F64 => Self::data_callback::<f64>(data, &mut buffer, &mut scratch),
+                // Rejected in `build_stream`, so unreachable in practice.
+                _ => {}
             },
             Self::err_fn,
             None,
-        )
+        )?;
+
+        self.stream = Some(stream);
+        Ok(self.stream.as_ref().unwrap())
     }
 
     /// Queues interleaved samples for playback. `S` is any real sample type, so
     /// `&[f32]`, `&[i16]`, `&[u8]`, ... all work directly with no conversion by
     /// the caller. Returns how many samples were accepted — a short count means
     /// the ring buffer was full and the rest were dropped.
-    pub fn add_samples<S: SampleType>(&mut self, samples: &[S]) -> usize {
-        samples
-            .iter()
-            .take_while(|sample| self.producer.try_push(sample.to_f32()).is_ok())
-            .count()
+    /// `index` index to place the first sample in the ring buffer.
+    pub fn add_samples<S: SampleType>(&mut self, samples: &[S], index: usize) -> usize {
+        // First check that the selected sample type is the same as the one we're using
+        assert_eq!(S::format(), self.sample_type);
+
+        let mut index = index;
+        for sample in samples {
+            // A full ring buffer means the callback hasn't drained yet; drop the
+            // rest rather than panicking on the producer side.
+            if self.producer.try_push(sample.to_f32()).is_err() {
+                break;
+            }
+            index += 1;
+        }
+        index
     }
 
     fn err_fn(err: cpal::Error) {

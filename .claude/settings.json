@@ -17,7 +17,8 @@
       "Read(//Users/jonathanstoff/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ringbuf-0.5.1/src/**)",
       "Bash(grep -n \"pub enum ErrorKind\" -A 60 /Users/jonathanstoff/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cpal-0.18.1/src/error.rs | head -80; echo \"=== Error::new ===\"; grep -n \"impl Error\" -A 25 /Users/jonathanstoff/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cpal-0.18.1/src/error.rs | head -40)",
       "Bash(python3 - /private/tmp/claude-501/-Users-jonathanstoff-Desktop-Scripts-rust-libs-atome/9c097a41-ae4a-4cfd-8402-de81107278aa/scratchpad/tcheck/src/lib.rs)",
-      "Bash(cargo test *)"
+      "Bash(cargo test *)",
+      "Bash(grep -n \"pub type SampleRate\\\\|pub struct SampleRate\\\\|pub sample_rate\\\\|pub struct StreamConfig\" -A 12 /Users/jonathanstoff/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cpal-0.18.1/src/lib.rs | head -50; echo \"=== BufferSize ===\"; grep -n \"pub enum BufferSize\" -A 20 /Users/jonathanstoff/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cpal-0.18.1/src/lib.rs | head -30)"
     ]
   }
 }
