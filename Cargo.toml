@@ -17,3 +17,44 @@ categories = ["Multimedia", "Encoding"]
 atomic-queue = "2.2.0"
 cpal = "0.18.1"
 ringbuf = "0.5.1"
+
+
+# Pulled in by the `vst3` feature. Its default `cpal-backend` is off: atome owns
+# the cpal stream, so vst3-host's own playback backend would be dead weight
+# (it wants cpal 0.18 too, so there is no version conflict either way).
+# `process-isolation` is kept — it runs plugins out-of-process so a crashing
+# one can't take the host down.
+vst3-host = { version = "0.9.0", optional = true, default-features = false, features = [
+    "process-isolation",
+] }
+
+# AU feature:
+truce-rack-au = { version = "1.1.5", optional = true, default-features = false}
+
+[features]
+default = []
+
+# --- Host backends ---
+
+# ASIO output, via cpal's own ASIO backend, plus the `output::asio` helpers.
+#
+# Windows only in practice: cpal declares `asio-sys` as a Windows-target
+# dependency and puts the ASIO host behind `#[cfg(windows)]`, so on other
+# platforms this compiles but finds no ASIO host. Building it on Windows needs
+# the ASIO SDK and LLVM/Clang on PATH — see cpal's README.
+asio = ["cpal/asio"]
+
+# --- Plugin formats ---
+# Each one gates the matching module under `plugins`. Only `vst` has a hosting
+# backend so far; `vst3` and `au` compile scaffolding and nothing more until one
+# is chosen and added as an optional dependency above.
+
+# Steinberg VST 2.4 plugin hosting, via the `vst` crate.
+vst = ["dep:vst"]
+# Steinberg VST 3 plugin hosting, via the `vst3-host` crate.
+vst3 = ["dep:vst3-host"]
+# Apple Audio Unit (v2/v3) plugin hosting. macOS/iOS only.
+au = ["dep:truce-rack-au"]
+
+# Convenience: every plugin format at once.
+plugins = ["vst", "vst3", "au"]

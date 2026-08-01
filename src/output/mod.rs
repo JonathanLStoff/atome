@@ -1,25 +1,42 @@
 use cpal::traits::DeviceTrait;
-use cpal::{Data, Device, Error, ErrorKind, SampleFormat, Stream, StreamConfig};
+use cpal::{Device, Error, ErrorKind, SampleFormat, Stream, StreamConfig};
 use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
+use std::marker::PhantomData;
 
 
+pub mod mixer;
 pub mod types;
 pub mod utils;
 
+pub use mixer::{ClearSignal, MixCommand, Mixer, MixerHandle};
 pub use types::{OutputType, SampleRate, SampleType};
 pub use utils::{default_device, find_device, list_device_names, list_devices, device_name};
 
 /// Frames assumed when the caller asks for the device's default buffer size.
 /// Only used to size the ring buffer — the stream itself still asks the device
 /// for its own preferred size.
+///
+/// The ring holds exactly one buffer size, so this is a guess at a number the
+/// device actually decides. If the device then picks a period *larger* than
+/// this, the ring cannot hold a whole callback and every callback gets a
+/// partially filled buffer. Pass an explicit `buffer_size` to make the two match.
 const DEFAULT_BUFFER_FRAMES: i32 = 1024;
+
+/// How many `MixCommand`s can be queued before `add_samples` starts refusing.
+const COMMAND_QUEUE_LEN: usize = 256;
 
 /// # OutputClass
 ///
-/// Used to hold a stream to a single output
+/// Used to hold a stream to a single output.
+///
+/// `S` *is* the sample type this output speaks: `OutputClass<f32>`,
+/// `OutputClass<i16>`, `OutputClass<cpal::I24>`, and so on. Fixing it at the
+/// type level means the callback is picked once, when the stream is built,
+/// instead of re-deciding on every audio callback, and `add_samples` can only
+/// ever be handed matching data.
 
-pub struct OutputClass {
+pub struct OutputClass<S: SampleType> {
     // Number of channels in this output
     channels: u16,
     // Output device to use
@@ -30,23 +47,24 @@ pub struct OutputClass {
     buffer_size: Option<i32>,
     // The sample rate
     sample_rate: SampleRate,
-    // The runtime tag for the sample type: [i8, i16, i24, i32, i64, u8, u16, u24, u32, u64, F32, F64, DsdU8, DsdU16, DsdU32].
-    // `SampleType` is a trait, so it can only bound a generic parameter, never
-    // be a field; `SampleFormat` is its value-level counterpart, and
-    // `S::format()` maps one to the other.
-    sample_type: SampleFormat,
     // stream for cpal
     stream: Option<Stream>,
     // Config the stream is (or will be) built with
     stream_config: StreamConfig,
-    // Producer half of the ring buffer: `add_samples` writes here
-    producer: HeapProd<f32>,
-    // Consumer half: taken by `build_stream` and moved into the audio callback
-    consumer: Option<HeapCons<f32>>,
+    // Mixer input queue: `add_samples` writes indexed work here, never audio
+    commands: HeapProd<MixCommand<S>>,
+    // Consumer half of the audio ring buffer, sized to exactly one buffer size:
+    // taken by `build_stream` and moved into the audio callback. The mixer owns
+    // the producer half and keeps it topped up.
+    consumer: Option<HeapCons<S>>,
+    // Keeps the mixer thread running for as long as this output exists
+    mixer: MixerHandle,
+    // The sample type lives only in the type system; nothing is stored for it.
+    sample_type: PhantomData<S>,
 }
 
-impl OutputClass {
-    pub fn new(device: Option<Device>, out_type: OutputType, channels: u16, sample_rate:SampleRate, sample_type: SampleFormat, buffer_size: Option<i32>) -> Self {
+impl<S: SampleType> OutputClass<S> {
+    pub fn new(device: Option<Device>, out_type: OutputType, channels: u16, sample_rate:SampleRate, buffer_size: Option<i32>) -> Self {
         // `None` lets the device pick its own buffer size. We can't know that
         // size until the stream is built, so the ring buffer is sized off a
         // default instead.
@@ -55,17 +73,23 @@ impl OutputClass {
             None => cpal::BufferSize::Default,
         };
         let frames = buffer_size.unwrap_or(DEFAULT_BUFFER_FRAMES).max(1) as usize;
-        
-        
+
+
         let stream_config = StreamConfig {
             channels,
             sample_rate: sample_rate as u32,
             buffer_size: buffer_size_form,
         };
 
-        // Room for a few callback periods so a late producer does not underrun.
-        let capacity = frames * channels.max(1) as usize * 4;
-        let (producer, consumer) = HeapRb::<f32>::new(capacity).split();
+        // Exactly one buffer size: this ring holds only the samples about to go
+        // to CPAL, never more. Everything further ahead stays in the mixer's own
+        // buffer, where later commands can still be summed into it.
+        let capacity = frames * channels.max(1) as usize;
+        let (audio_producer, consumer) = HeapRb::<S>::new(capacity).split();
+
+        // add_samples -> commands -> mixer -> audio ring buffer -> callback.
+        let (commands, pending) = HeapRb::<MixCommand<S>>::new(COMMAND_QUEUE_LEN).split();
+        let mixer = MixerHandle::spawn(Mixer::new(pending, audio_producer));
 
         OutputClass {
             channels,
@@ -74,11 +98,12 @@ impl OutputClass {
             out_type,
             buffer_size,
             sample_rate,
-            sample_type,
             stream: None,
             stream_config,
-            producer,
+            commands,
             consumer: Some(consumer),
+            mixer,
+            sample_type: PhantomData,
         }
     }
 
@@ -87,7 +112,7 @@ impl OutputClass {
     }
     pub fn device(&self) -> Device {
         self.device.clone()
-    }  
+    }
     pub fn name(&self) -> String {
         device_name(&self.device)
     }
@@ -98,73 +123,63 @@ impl OutputClass {
     pub fn sample_rate(&self) -> i32 {
         self.sample_rate as i32
     }
+    /// The value-level tag for `S`, for when a `SampleFormat` is needed at runtime.
     pub fn sample_format(&self) -> SampleFormat {
-        self.sample_type
+        S::format()
     }
 
     pub fn sample_type(&self) -> SampleFormat {
-        self.sample_type
+        S::format()
     }
     pub fn out_type(&self) -> OutputType {
         self.out_type
     }
-    /// The body of the output callback, generic over the device's sample type.
+    /// The body of the output callback.
     ///
-    /// Pops one callback's worth of interleaved samples out of the ring buffer
-    /// and hands them to the host as `S`. `add_samples` already writes frames
-    /// interleaved (L,R,L,R,…), so popping a contiguous run preserves that
-    /// layout — the samples go out in exactly the order they came in.
+    /// The ring buffer already holds `S`, so this pops one callback's worth of
+    /// interleaved samples straight into the device's buffer — no conversion, no
+    /// scratch buffer, no allocation on the audio thread. `add_samples` queues
+    /// frames interleaved (L,R,L,R,…) and the ring buffer is FIFO, so they go
+    /// out in exactly the order they came in.
     ///
-    /// `scratch` is owned by the caller and reused across calls so the callback
-    /// never allocates on the audio thread.
-    fn data_callback<S: SampleType>(
-        data: &mut Data,
-        buffer: &mut HeapCons<f32>,
-        scratch: &mut Vec<f32>,
+    /// This is also the only place the ring buffer can be emptied — the mixer
+    /// holds the producer half and cannot take anything back out — so a
+    /// [`stop`](Self::stop) is finished here, not where it is asked for.
+    fn data_callback(
+        data: &mut [S],
+        buffer: &mut HeapCons<S>,
+        clear: &ClearSignal,
+        cleared: &mut usize,
     ) {
-        let data = data
-            .as_slice_mut::<S>()
-            .expect("host supplied a buffer of a different sample type");
-
-        // The ring buffer holds f32, so pop into scratch and convert on the way
-        // out. `resize` only ever allocates on the first few callbacks.
-        if scratch.len() < data.len() {
-            scratch.resize(data.len(), 0.0);
+        let epoch = clear.epoch();
+        if epoch != *cleared {
+            // A stop is in flight: drop what was already committed and play
+            // silence instead of it. This keeps happening until the mixer has
+            // answered the same stop, because until then it may still be
+            // flushing pre-stop samples into the ring behind us.
+            buffer.clear();
+            data.fill(S::SILENCE);
+            if clear.acked() == epoch {
+                *cleared = epoch;
+            }
+            return;
         }
-        let frames = &mut scratch[..data.len()];
 
-        let read = buffer.pop_slice(frames);
-        if read < frames.len() {
+        let read = buffer.pop_slice(data);
+        if read < data.len() {
             // Underrun: pad with silence rather than replaying stale audio.
-            frames[read..].fill(0.0);
-        }
-
-        for (dst, sample) in data.iter_mut().zip(frames.iter()) {
-            *dst = S::from_f32(sample.clamp(-1.0, 1.0));
+            data[read..].fill(S::SILENCE);
         }
     }
 
     /// Builds the cpal output stream for this output's device, pulling mixed
-    /// samples out of its ring buffer and writing them in whatever sample format
-    /// the device requires. The resulting `Stream` is stored on `self` (streams
-    /// must be kept alive to keep playing) and also returned.
+    /// samples out of its ring buffer and writing them as `S`. The resulting
+    /// `Stream` is stored on `self` (streams must be kept alive to keep playing)
+    /// and also returned.
     ///
     /// Consumes the consumer half of the ring buffer, so it can only be called
     /// once per `OutputClass`.
     pub fn build_stream(&mut self) -> Result<&Stream, Error> {
-        // Checked before taking the consumer, so a rejected format leaves the
-        // output still buildable.
-        if matches!(
-            self.sample_type,
-            SampleFormat::DsdU8 | SampleFormat::DsdU16 | SampleFormat::DsdU32
-        ) {
-            // DSD is a 1-bit bitstream, not PCM — nothing to convert f32 into.
-            return Err(Error::with_message(
-                ErrorKind::UnsupportedConfig,
-                "DSD output is not supported",
-            ));
-        }
-
         let mut buffer = self.consumer.take().ok_or_else(|| {
             Error::with_message(
                 ErrorKind::UnsupportedOperation,
@@ -172,34 +187,15 @@ impl OutputClass {
             )
         })?;
 
-        let sample_type = self.sample_type;
-        let mut scratch = Vec::<f32>::new();
+        // Shared with the mixer thread so `stop` can reach the samples that are
+        // already past it, sitting in the ring buffer.
+        let clear = self.mixer.clear_signal();
+        let mut cleared = clear.epoch();
 
-        // The raw API hands the callback an untyped `Data`, so the sample type
-        // is only known at runtime: dispatch once per callback to the right
-        // instantiation of `data_callback`.
-        let stream = self.device.build_output_stream_raw(
+        let stream = self.device.build_output_stream(
             self.stream_config,
-            sample_type,
-            move |data: &mut Data, _: &cpal::OutputCallbackInfo| match sample_type {
-                SampleFormat::I8 => Self::data_callback::<i8>(data, &mut buffer, &mut scratch),
-                SampleFormat::I16 => Self::data_callback::<i16>(data, &mut buffer, &mut scratch),
-                SampleFormat::I24 => {
-                    Self::data_callback::<cpal::I24>(data, &mut buffer, &mut scratch)
-                }
-                SampleFormat::I32 => Self::data_callback::<i32>(data, &mut buffer, &mut scratch),
-                SampleFormat::I64 => Self::data_callback::<i64>(data, &mut buffer, &mut scratch),
-                SampleFormat::U8 => Self::data_callback::<u8>(data, &mut buffer, &mut scratch),
-                SampleFormat::U16 => Self::data_callback::<u16>(data, &mut buffer, &mut scratch),
-                SampleFormat::U24 => {
-                    Self::data_callback::<cpal::U24>(data, &mut buffer, &mut scratch)
-                }
-                SampleFormat::U32 => Self::data_callback::<u32>(data, &mut buffer, &mut scratch),
-                SampleFormat::U64 => Self::data_callback::<u64>(data, &mut buffer, &mut scratch),
-                SampleFormat::F32 => Self::data_callback::<f32>(data, &mut buffer, &mut scratch),
-                SampleFormat::F64 => Self::data_callback::<f64>(data, &mut buffer, &mut scratch),
-                // Rejected in `build_stream`, so unreachable in practice.
-                _ => {}
+            move |data: &mut [S], _: &cpal::OutputCallbackInfo| {
+                Self::data_callback(data, &mut buffer, &clear, &mut cleared)
             },
             Self::err_fn,
             None,
@@ -209,28 +205,216 @@ impl OutputClass {
         Ok(self.stream.as_ref().unwrap())
     }
 
-    /// Queues interleaved samples for playback. `S` is any real sample type, so
-    /// `&[f32]`, `&[i16]`, `&[u8]`, ... all work directly with no conversion by
-    /// the caller. Returns how many samples were accepted — a short count means
-    /// the ring buffer was full and the rest were dropped.
-    /// `index` index to place the first sample in the ring buffer.
-    pub fn add_samples<S: SampleType>(&mut self, samples: &[S], index: usize) -> usize {
-        // First check that the selected sample type is the same as the one we're using
-        assert_eq!(S::format(), self.sample_type);
+    /// Schedules interleaved samples for playback at absolute sample `index`,
+    /// summing them with anything already scheduled there. They stay in this
+    /// output's sample type the whole way — `&[i16]` into an `OutputClass<i16>`
+    /// is queued, mixed, and played as `i16`, never converted.
+    ///
+    /// This only hands a [`MixCommand`] to the mixer — no audio touches the
+    /// stream's ring buffer here. Returns the index just past the batch, ready
+    /// to pass straight back in for the next one.
+    ///
+    /// Fails if the mixer's command queue is full, which means it is not
+    /// draining fast enough; the whole batch is refused rather than half of it.
+    pub fn add_samples(&mut self, samples: &[S], index: usize) -> Result<usize, Error> {
+        
+        
+        let command = MixCommand {
+            index,
+            samples: samples.to_vec(),
+        };
 
-        let mut index = index;
-        for sample in samples {
-            // A full ring buffer means the callback hasn't drained yet; drop the
-            // rest rather than panicking on the producer side.
-            if self.producer.try_push(sample.to_f32()).is_err() {
-                break;
-            }
-            index += 1;
+        self.commands.try_push(command).map_err(|_| {
+            Error::with_message(ErrorKind::ResourceExhausted, "mixer command queue is full")
+        })?;
+
+        Ok(index + samples.len())
+    }
+    /// Schedules interleaved samples for playback at a `time`.
+    /// Time is in secounds from now, so it will delay the start of the audio 
+    pub fn add_samples_time(&mut self, samples: &[S], time: usize) -> Result<usize, Error> {
+        
+        let index = time * self.sample_rate
+        
+        let command = MixCommand {
+            index,
+            samples: samples.to_vec(),
+        };
+
+        self.commands.try_push(command).map_err(|_| {
+            Error::with_message(ErrorKind::ResourceExhausted, "mixer command queue is full")
+        })?;
+
+        Ok(index + samples.len())
+    }
+
+    /// Deletes all samples that have been scheduled but not yet played, and resets the
+    /// mixer to the current time. This is useful if you want to stop all audio
+    /// immediately and start fresh.
+    ///
+    /// Both stages are cleared: the mixer's queued commands and accumulation
+    /// buffer, and the ring buffer the audio callback is already reading from —
+    /// otherwise up to one buffer of committed audio would still play out.
+    ///
+    /// The stream keeps running and plays silence; the output stays usable and
+    /// [`add_samples`](Self::add_samples) works again straight away. It is not
+    /// instant: the mixer answers on its next pass and the callback on its
+    /// next, so the tail is at most one buffer long.
+    ///
+    /// The play cursor does not move: it is an absolute position in the stream,
+    /// not a count of what got played, so anything scheduled behind it is still
+    /// late after a stop.
+    pub fn stop(&mut self) {
+        self.mixer.clear_samples();
+    }
+
+    /// Handle to the mixer thread feeding this output.
+    pub fn mixer(&self) -> &MixerHandle {
+        &self.mixer
+    }
+    /// Aligns the samples to the output's sample rate and channel count.
+    ///
+    /// Set `interleaved` to describe what you are handing in: `true` for frames
+    /// (L,R,L,R,…), `false` for planar data, where each channel is one
+    /// contiguous run. Planar input is woven into frames before anything else
+    /// happens to it.
+    ///
+    /// The result is always interleaved at `self.channels` / `self.sample_rate`,
+    /// ready to hand to [`add_samples`](Self::add_samples). Fails if `channels`
+    /// is zero or `samples` does not hold a whole number of frames.
+    pub fn align_samples(&self, samples: &[S], sample_rate: SampleRate, channels: u16, interleaved: bool) -> Result<Vec<S>, Error> {
+        if channels == 0 {
+            return Err(Error::with_message(
+                ErrorKind::InvalidInput,
+                "sample data must have at least one channel",
+            ));
         }
-        index
+        let src_channels = channels as usize;
+        if samples.len() % src_channels != 0 {
+            return Err(Error::with_message(
+                ErrorKind::InvalidInput,
+                "sample count is not a whole number of frames",
+            ));
+        }
+        // The device always takes interleaved data, so interleaved input that
+        // already matches the output needs nothing done to it.
+        if sample_rate == self.sample_rate && channels == self.channels && interleaved {
+            return Ok(samples.to_vec());
+        }
+
+        let dst_channels = self.channels.max(1) as usize;
+        let frames = samples.len() / src_channels;
+
+        // Weave first: everything after this point indexes by frame, so planar
+        // input has to become frames before it can be remapped or resampled.
+        // One channel is the same bytes either way, so it skips the copy.
+        let mut buffer = if interleaved || src_channels == 1 {
+            samples.to_vec()
+        } else {
+            Self::weave(samples, frames, src_channels)
+        };
+
+        if src_channels != dst_channels {
+            buffer = Self::map_channels(&buffer, frames, src_channels, dst_channels);
+        }
+
+        if sample_rate != self.sample_rate {
+            buffer = Self::resample(
+                &buffer,
+                frames,
+                dst_channels,
+                sample_rate as u32,
+                self.sample_rate as u32,
+            );
+        }
+
+        Ok(buffer)
+    }
+
+    /// Weaves planar samples — channel 0's `frames` samples, then channel 1's,
+    /// and so on — into interleaved frames (L,R,L,R,…), the only layout the
+    /// mixer and the device ever see.
+    fn weave(samples: &[S], frames: usize, channels: usize) -> Vec<S> {
+        let mut out = Vec::with_capacity(samples.len());
+        for frame in 0..frames {
+            for channel in 0..channels {
+                out.push(samples[(channel * frames) + frame]);
+            }
+        }
+        out
+    }
+
+    /// Re-lays `frames` interleaved frames of `src_channels` into `dst_channels`.
+    ///
+    /// Mono input fans out to every output channel and a mono output sums the
+    /// input down; anything else keeps channel `n` as channel `n`, dropping
+    /// the extras when narrowing and filling with silence when widening. That
+    /// is deliberately dumb about channel *meaning* — a 5.1 stream narrowed to
+    /// stereo keeps front-left/front-right and loses the rest rather than
+    /// folding them in.
+    fn map_channels(samples: &[S], frames: usize, src_channels: usize, dst_channels: usize) -> Vec<S> {
+        let mut out = Vec::with_capacity(frames * dst_channels);
+        for frame in 0..frames {
+            let start = frame * src_channels;
+            if src_channels == 1 {
+                out.extend(std::iter::repeat(samples[start]).take(dst_channels));
+            } else if dst_channels == 1 {
+                // Summed with the format's own `mix`, so an `i16` source stays
+                // `i16` the whole way down — no float round-trip. Folding N
+                // channels into one is correspondingly louder and can overflow
+                // the format, so attenuate before calling if the source is hot.
+                let mut sum = S::SILENCE;
+                for sample in &samples[start..start + src_channels] {
+                    sum = sum.mix(*sample);
+                }
+                out.push(sum);
+            } else {
+                for channel in 0..dst_channels {
+                    out.push(if channel < src_channels {
+                        samples[start + channel]
+                    } else {
+                        S::SILENCE
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Resamples interleaved `frames` from `from` Hz to `to` Hz, linearly
+    /// interpolating between the two input frames each output frame falls
+    /// between.
+    ///
+    /// Linear interpolation is cheap and has no pre-ring, but it is not
+    /// band-limited: downsampling folds anything above the new Nyquist back
+    /// into the audible range, so low-pass filter first if the source has real
+    /// content up there.
+    fn resample(samples: &[S], frames: usize, channels: usize, from: u32, to: u32) -> Vec<S> {
+        if frames == 0 {
+            return Vec::new();
+        }
+        let ratio = to as f64 / from as f64;
+        let out_frames = ((frames as f64) * ratio).round().max(1.0) as usize;
+        let last = frames - 1;
+
+        let mut out = Vec::with_capacity(out_frames * channels);
+        for frame in 0..out_frames {
+            // Where this output frame lands on the input timeline.
+            let position = frame as f64 / ratio;
+            let left = (position.floor() as usize).min(last);
+            let right = (left + 1).min(last);
+            let t = (position - position.floor()) as f32;
+            for channel in 0..channels {
+                let a = samples[left * channels + channel].to_f32();
+                let b = samples[right * channels + channel].to_f32();
+                out.push(S::from_f32(a + (b - a) * t));
+            }
+        }
+        out
     }
 
     fn err_fn(err: cpal::Error) {
         eprintln!("audio output stream error: {}", err);
     }
+
 }

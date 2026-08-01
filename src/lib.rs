@@ -15,25 +15,32 @@ use std::thread;
 use std::time::Duration;
 
 pub mod output;
+pub mod plugins;
 
 
 
 // TODO: Gain control
 // TODO: Plugin flow
-// TODO: 
+// TODO: default plugins
+// TODO: add asio, vst,vst3 and au features
+// TODO: Fix the stuff that claud broke like all of the init stuff
 
 /// The main audio engine. Producers can push audio chunks via `add_samples`.
 pub struct AudioEngine {
     /// The CPAL audio stream – must be kept alive.
     _stream: Option<Stream>,
+    /// Device
+    device: Device,
     /// Shared MPMC queue for incoming audio chunks.
     queue: Arc<Queue<Vec<f32>>>,
     /// Final SPSC ring buffer read by the audio callback.
     output_buffer: Arc<HeapRb<f32>>,
     /// Number of frames per chunk (e.g., 512).
     buffer_size: usize,
-    /// This is not used here, it is used as part of output object
-    // channels: usize,
+    /// Sample rate.
+    sample_rate: usize,
+    /// Number of channels.
+    channels: usize,
 }
 
 impl AudioEngine {
@@ -41,12 +48,15 @@ impl AudioEngine {
     ///
     /// The engine uses the default output device and assumes 48 kHz, stereo, f32.
     /// Panics if audio device initialisation fails.
-    pub fn new(buffer_size_frames: usize) -> Self {
+    pub fn new(buffer_size_frames: usize, sample_rate: usize, channels: usize, device: Option<Device>) -> Self {
         // 1. Setup CPAL device & config
         let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .expect("no output device available");
+        if device.is_none() {
+            device = host
+                .default_output_device()
+                .expect("no output device available");
+        }
+        let device = device.unwrap();
         let config = device.default_output_config().unwrap();
         let sample_rate = config.sample_rate().0;
         let channels = config.channels() as usize;

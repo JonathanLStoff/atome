@@ -34,6 +34,10 @@ pub enum SampleRate {
 /// function can take `samples: &[S] where S: SampleType` and be called with a
 /// plain `&[f32]`, `&[i16]`, `&[u8]`, ... with no conversion at the call site.
 ///
+/// It only ever bounds a type parameter — `S: SampleType` reads as "S is a
+/// sample type", so `OutputClass<f32>` or `data_callback::<i16>` names the
+/// concrete type directly and the compiler picks the conversions for it.
+///
 /// Implemented (via the blanket impl below) for every type cpal can hand to a
 /// stream callback:
 ///
@@ -48,13 +52,29 @@ pub enum SampleRate {
 /// bitstream packed into `u8`/`u16`/`u32`, so it stays a [`SampleFormat`]-level
 /// concept and is not part of this trait.
 pub trait SampleType: SizedSample + Send + 'static {
+    /// The value that means silence for this type: `0` for the signed and float
+    /// formats, the midpoint (`128`, `32768`, …) for the unsigned ones.
+    const SILENCE: Self;
+
     /// The [`SampleFormat`] this type is laid out as on a device.
     fn format() -> SampleFormat;
 
-    /// Convert into the engine's internal representation: `f32` in `-1.0..=1.0`.
+    /// Sums two samples **in their own format** — no float round-trip, so an
+    /// `i16` pipeline stays `i16` from `add_samples` all the way to the device.
+    ///
+    /// Silence is the identity: mixing with [`SILENCE`](Self::SILENCE) is a
+    /// no-op, including for the unsigned formats where silence isn't zero.
+    ///
+    /// Summing has the range of the format itself, so loud sources can overflow
+    /// it (wrapping in release, panicking in debug) exactly as an integer `+`
+    /// would. Leave headroom, or attenuate before mixing.
+    fn mix(self, other: Self) -> Self;
+
+    /// Convert to `f32` in `-1.0..=1.0`. Not used by the pipeline — only for
+    /// callers that want to inspect or process samples in float.
     fn to_f32(self) -> f32;
 
-    /// Convert back out of the engine's internal `f32` representation.
+    /// Convert back from an `f32` in `-1.0..=1.0`.
     fn from_f32(sample: f32) -> Self;
 }
 
@@ -63,8 +83,16 @@ where
     T: SizedSample + Send + 'static + FromSample<f32>,
     f32: FromSample<T>,
 {
+    const SILENCE: Self = <T as Sample>::EQUILIBRIUM;
+
     fn format() -> SampleFormat {
         <T as SizedSample>::FORMAT
+    }
+
+    fn mix(self, other: Self) -> Self {
+        // `add_amp` adds an offset *from* equilibrium, which is what makes this
+        // correct for the unsigned formats too.
+        self.add_amp(other.to_signed_sample())
     }
 
     fn to_f32(self) -> f32 {
