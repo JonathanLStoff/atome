@@ -1,0 +1,186 @@
+# Publishes to crates.io when a `rel-<version>` branch is pushed, then tags the
+# commit `v<version>` and opens a GitHub release for it.
+#
+# The branch name is the release: pushing `rel-0.8.0` publishes 0.8.0. That
+# version has to match `Cargo.toml` — the job fails rather than publishing
+# something the branch name did not ask for, since a publish cannot be undone.
+name: publish
+
+on:
+  push:
+    branches:
+      - 'rel-*'
+
+permissions:
+  contents: read
+
+# Never two publishes of the same branch at once.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: crates.io
+    runs-on: ubuntu-latest
+
+    # Tagging the commit and creating the release both write to the repository.
+    permissions:
+      contents: write
+
+    steps:
+      # Release notes are generated from the history, which a shallow clone
+      # does not have.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install the stable toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+
+      # The branch name is the only place the version is stated by hand, so it
+      # is checked before anything is built.
+      - name: Read the version from the branch name
+        id: release
+        run: |
+          set -euo pipefail
+
+          branch="${GITHUB_REF_NAME}"
+          version="${branch#rel-}"
+
+          if [ "$version" = "$branch" ] || [ -z "$version" ]; then
+            echo "::error::branch '$branch' is not of the form rel-<version>"
+            exit 1
+          fi
+
+          # Semver, allowing a pre-release and build metadata: rel-1.2.3,
+          # rel-1.2.3-rc.1, rel-1.2.3+build.5.
+          semver='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+          if ! printf '%s' "$version" | grep -Eq "$semver"; then
+            echo "::error::'$version' is not a semver version"
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Releasing $version"
+
+      # A branch that disagrees with the manifest means one of the two was not
+      # updated, and publishing either would be wrong.
+      - name: Check Cargo.toml agrees
+        id: crate
+        run: |
+          set -euo pipefail
+
+          metadata="$(cargo metadata --no-deps --format-version 1)"
+          name="$(printf '%s' "$metadata" | jq -r '.packages[0].name')"
+          manifest="$(printf '%s' "$metadata" | jq -r '.packages[0].version')"
+          branch="${{ steps.release.outputs.version }}"
+
+          if [ "$manifest" != "$branch" ]; then
+            echo "::error::branch says $branch, Cargo.toml says $manifest"
+            exit 1
+          fi
+
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      # Re-running a workflow, or pushing again to the same branch, should not
+      # fail on a version that is already out there.
+      #
+      # The User-Agent is not optional: crates.io answers 403 to requests
+      # without one, and reading that as "not published" would make this check
+      # quietly useless.
+      - name: Check whether this version is already published
+        id: existing
+        run: |
+          set -euo pipefail
+
+          name="${{ steps.crate.outputs.name }}"
+          version="${{ steps.release.outputs.version }}"
+          status="$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "User-Agent: ${{ github.repository }} release workflow" \
+            "https://crates.io/api/v1/crates/$name/$version")"
+
+          case "$status" in
+            200)
+              echo "::notice::$name $version is already on crates.io; nothing to do"
+              echo "published=true" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "published=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              # Carry on rather than guess. Publishing a duplicate fails loudly
+              # in cargo; skipping a release that should have happened would
+              # not fail at all, which is the worse of the two.
+              echo "::warning::crates.io answered $status; assuming not published"
+              echo "published=false" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      - name: Build
+        if: steps.existing.outputs.published == 'false'
+        run: cargo build --verbose
+
+      # `import` only: `import-all` builds libfdk-aac and libopus from source,
+      # which is a slow way to find out nothing about this crate's own code.
+      - name: Test
+        if: steps.existing.outputs.published == 'false'
+        run: cargo test --features import --verbose
+
+      # Packages and builds exactly what would be uploaded, without uploading
+      # it — this is where a missing file or a path dependency shows up.
+      - name: Dry run
+        if: steps.existing.outputs.published == 'false'
+        run: cargo publish --dry-run --verbose
+
+      # `--no-verify` because the dry run above already built the packaged
+      # crate; doing it twice only makes the release slower.
+      - name: Publish
+        if: steps.existing.outputs.published == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --no-verify
+
+      # Deliberately not gated on `published == 'false'`: if a previous run
+      # uploaded the crate and then failed here, re-running the workflow has to
+      # be able to finish the job. The step is idempotent instead — an existing
+      # release for the tag is left alone rather than replaced.
+      #
+      # The tag is created by `gh release create --target`, so it only ever
+      # exists for a version that actually reached crates.io.
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          name="${{ steps.crate.outputs.name }}"
+          version="${{ steps.release.outputs.version }}"
+          tag="v$version"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::notice::release $tag already exists; leaving it as it is"
+            exit 0
+          fi
+
+          # A version with a pre-release part (1.2.3-rc.1) is not the version
+          # people should land on from the releases page.
+          prerelease=""
+          case "$version" in
+            *-*) prerelease="--prerelease" ;;
+          esac
+
+          # `--notes` is the header; `--generate-notes` appends the commit log
+          # since the previous release under it.
+          gh release create "$tag" \
+            --target "$GITHUB_SHA" \
+            --title "$name $version" \
+            --generate-notes \
+            $prerelease \
+            --notes "[crates.io](https://crates.io/crates/$name/$version) · [docs.rs](https://docs.rs/$name/$version)"

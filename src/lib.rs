@@ -1,197 +1,423 @@
-//! A real‑time audio engine using atomic‑queue (MPMC) and ringbuf (SPSC).
+//! A real-time audio engine over cpal.
 //!
-//! The engine runs a background mixer thread that collects audio chunks from
-//! multiple producers, sums them, and writes the mixed result into a ring buffer.
-//! The CPAL audio callback reads from that ring buffer and sends it to the sound card.
+//! [`AudioEngine`] owns every stream and decides what reaches which device. It
+//! is given a list of inputs and a list of outputs, both described as
+//! [`AtomeDevice`]s, and builds an [`InputClass`] or [`OutputClass`] for each.
+//!
+//! # Routing
+//!
+//! An input with no routing feeds every output. An input that names outputs
+//! feeds only those, so a talkback microphone can reach the monitors without
+//! also reaching the main mix.
+//!
+//! # Plugins
+//!
+//! A [`Plugin`] attaches at one of three levels, and where it attaches is what
+//! decides how much audio it hears:
+//!
+//! | Attached to | Hears |
+//! |---|---|
+//! | An input's `AtomeDevice` | that input alone, before routing |
+//! | An output's `AtomeDevice` | what that device plays, after mixing |
+//! | [`AudioEngine::new`] directly | everything |
+//!
+//! ```no_run
+//! use atome::{device::AtomeDevice, AudioEngine};
+//! use atome::output::{OutputType, SampleRate};
+//!
+//! let mic = AtomeDevice::default_input(OutputType::CoreAudio)
+//!     .expect("no input device");
+//! let speakers = AtomeDevice::default_output(OutputType::CoreAudio)
+//!     .expect("no output device");
+//!
+//! let engine = AudioEngine::<f32>::new(
+//!     vec![mic],
+//!     vec![speakers],
+//!     SampleRate::Hz48k,
+//!     vec![2],
+//!     Some(512),
+//!     vec![],
+//! )?;
+//! # Ok::<(), cpal::Error>(())
+//! ```
 
-use atomic_queue::Queue;
-use cpal::{
-    traits::{DeviceTrait, HostTrait, StreamTrait},
-    BufferSize, Stream, StreamConfig,
-};
-use ringbuf::{HeapRb, Rb};
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
+use cpal::{Error, ErrorKind};
 
+pub mod device;
+pub mod import;
+pub mod input;
 pub mod output;
 pub mod plugins;
 
+pub use device::{AtomeDevice, Direction};
+pub use input::InputClass;
+pub use output::{OutputClass, SampleRate, SampleType};
+pub use plugins::Plugin;
 
-
-// TODO: Gain control
-// TODO: Plugin flow
-// TODO: default plugins
-// TODO: add asio, vst,vst3 and au features
-// TODO: Fix the stuff that claud broke like all of the init stuff
-
-/// The main audio engine. Producers can push audio chunks via `add_samples`.
-pub struct AudioEngine {
-    /// The CPAL audio stream – must be kept alive.
-    _stream: Option<Stream>,
-    /// Device
-    device: Device,
-    /// Shared MPMC queue for incoming audio chunks.
-    queue: Arc<Queue<Vec<f32>>>,
-    /// Final SPSC ring buffer read by the audio callback.
-    output_buffer: Arc<HeapRb<f32>>,
-    /// Number of frames per chunk (e.g., 512).
-    buffer_size: usize,
-    /// Sample rate.
-    sample_rate: usize,
-    /// Number of channels.
-    channels: usize,
+/// An input, its stream, and the outputs it feeds.
+pub struct EngineInput<S: SampleType> {
+    device: AtomeDevice,
+    input: InputClass<S>,
+    /// Indices into [`AudioEngine::outputs`], resolved once at construction so
+    /// the audio path never has to match a name against a list.
+    routes: Vec<usize>,
 }
 
-impl AudioEngine {
-    /// Creates a new audio engine with the given **buffer size (frames)**.
+impl<S: SampleType> EngineInput<S> {
+    pub fn device(&self) -> &AtomeDevice {
+        &self.device
+    }
+
+    pub fn input(&self) -> &InputClass<S> {
+        &self.input
+    }
+
+    pub fn input_mut(&mut self) -> &mut InputClass<S> {
+        &mut self.input
+    }
+
+    /// Which outputs this input feeds, by index.
+    pub fn routes(&self) -> &[usize] {
+        &self.routes
+    }
+}
+
+/// An output and its stream.
+pub struct EngineOutput<S: SampleType> {
+    device: AtomeDevice,
+    output: OutputClass<S>,
+}
+
+impl<S: SampleType> EngineOutput<S> {
+    pub fn device(&self) -> &AtomeDevice {
+        &self.device
+    }
+
+    pub fn output(&self) -> &OutputClass<S> {
+        &self.output
+    }
+
+    pub fn output_mut(&mut self) -> &mut OutputClass<S> {
+        &mut self.output
+    }
+}
+
+/// The main audio engine: every stream, and the routing between them.
+pub struct AudioEngine<S: SampleType> {
+    inputs: Vec<EngineInput<S>>,
+    outputs: Vec<EngineOutput<S>>,
+    sample_rate: SampleRate,
+    buffer_size: Option<i32>,
+    /// Applied to everything, whichever device it came from or goes to.
+    plugins: Vec<Plugin>,
+}
+
+impl<S: SampleType> AudioEngine<S> {
+    /// Builds an engine over the given devices.
     ///
-    /// The engine uses the default output device and assumes 48 kHz, stereo, f32.
-    /// Panics if audio device initialisation fails.
-    pub fn new(buffer_size_frames: usize, sample_rate: usize, channels: usize, device: Option<Device>) -> Self {
-        // 1. Setup CPAL device & config
-        let host = cpal::default_host();
-        if device.is_none() {
-            device = host
-                .default_output_device()
-                .expect("no output device available");
+    /// `output_channels` gives one channel count per output device, in the same
+    /// order — `[2, 2, 5]` for two stereo pairs and a five-channel rig. It is a
+    /// list rather than one number because devices on one engine genuinely
+    /// differ, and pairing them off by position is checked rather than assumed:
+    /// a list of the wrong length is an error, not a silent truncation.
+    ///
+    /// Inputs take their channel count from the hardware instead, since a
+    /// capture device gives what it has.
+    ///
+    /// Nothing is started here. Streams are built but paused, exactly as cpal
+    /// leaves them.
+    ///
+    /// # Errors
+    ///
+    /// - A device in `inputs` that is not an input, or in `outputs` that is not
+    ///   an output
+    /// - `output_channels` not the same length as `outputs`
+    /// - An input routed to a name that matches no output
+    pub fn new(
+        inputs: Vec<AtomeDevice>,
+        outputs: Vec<AtomeDevice>,
+        sample_rate: SampleRate,
+        output_channels: Vec<u16>,
+        buffer_size: Option<i32>,
+        plugins: Vec<Plugin>,
+    ) -> Result<Self, Error> {
+        if output_channels.len() != outputs.len() {
+            return Err(Error::with_message(
+                ErrorKind::InvalidInput,
+                format!(
+                    "{} output devices but {} channel counts",
+                    outputs.len(),
+                    output_channels.len()
+                ),
+            ));
         }
-        let device = device.unwrap();
-        let config = device.default_output_config().unwrap();
-        let sample_rate = config.sample_rate().0;
-        let channels = config.channels() as usize;
 
-        // We'll set the stream's buffer size to match our requested size.
-        let stream_config = StreamConfig {
-            channels: channels as u16,
-            sample_rate: cpal::SampleRate(sample_rate),
-            buffer_size: BufferSize::Fixed(buffer_size_frames as u32),
-        };
-
-        // 2. Create the MPMC queue (unbounded capacity, but we can limit it)
-        //    The queue holds entire chunks (Vec<f32>). We cap it to avoid unbounded growth.
-        let queue_capacity = 1024; // max number of pending chunks
-        let queue = Arc::new(Queue::<Vec<f32>>::with_capacity(queue_capacity));
-
-        // 3. Create the final SPSC ring buffer. We give it enough room for ~2 seconds.
-        let ring_capacity = (sample_rate * 2 * channels) as usize;
-        let output_buffer = Arc::new(HeapRb::<f32>::new(ring_capacity));
-        let output_buffer_clone = Arc::clone(&output_buffer);
-
-        // 4. Spawn the mixer thread
-        let queue_clone = Arc::clone(&queue);
-        let buffer_size = buffer_size_frames;
-        let channels_clone = channels;
-        thread::Builder::new()
-            .name("audio_mixer".to_string())
-            .spawn(move || {
-                // Allocate a working buffer once
-                let mut mixed = vec![0.0f32; buffer_size * channels_clone];
-
-                loop {
-                    // Collect all pending chunks from the queue (non‑blocking).
-                    // We pop until the queue is empty.
-                    let mut chunks = Vec::new();
-                    while let Some(chunk) = queue_clone.pop() {
-                        chunks.push(chunk);
-                    }
-
-                    // Mix (sum) all chunks into `mixed`.
-                    if chunks.is_empty() {
-                        // No audio – write silence.
-                        mixed.fill(0.0);
-                    } else {
-                        mixed.fill(0.0);
-                        for chunk in chunks {
-                            // Ensure the chunk has the expected length.
-                            // If not, we pad or truncate (here we truncate).
-                            let len = chunk.len().min(mixed.len());
-                            for i in 0..len {
-                                mixed[i] += chunk[i];
-                            }
-                        }
-                    }
-
-                    // Write the mixed block to the output ring buffer.
-                    // If the buffer is full, we drop the block (avoid blocking).
-                    let _ = output_buffer_clone.push_slice(&mixed);
-
-                    // Sleep a tiny bit to avoid burning CPU.
-                    // The sleep duration should be < buffer_size / sample_rate
-                    // to keep the buffer filled. Here we use 1 ms.
-                    thread::sleep(Duration::from_micros(1000));
-                }
-            })
-            .expect("failed to spawn mixer thread");
-
-        // 5. Build the CPAL stream with our callback.
-        let stream = match config.sample_format() {
-            cpal::SampleFormat::F32 => {
-                let out_buf = Arc::clone(&output_buffer);
-                device
-                    .build_output_stream(
-                        &stream_config,
-                        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                            // Read as many samples as possible from the ring buffer.
-                            let read = out_buf.pop_slice(data);
-                            // Fill the rest with silence.
-                            if read < data.len() {
-                                data[read..].fill(0.0);
-                            }
-                        },
-                        |err| eprintln!("audio stream error: {}", err),
-                        None,
-                    )
-                    .expect("failed to build output stream")
+        for device in &outputs {
+            if device.direction() != Direction::Output {
+                return Err(Error::with_message(
+                    ErrorKind::InvalidInput,
+                    format!("{} is an input device, listed as an output", device.name()),
+                ));
             }
-            _ => panic!("only f32 sample format is supported"),
-        };
-
-        stream.play().expect("failed to play stream");
-
-        AudioEngine {
-            _stream: Some(stream),
-            queue,
-            output_buffer,
-            buffer_size: buffer_size_frames,
-            channels,
         }
+
+        for device in &inputs {
+            if device.direction() != Direction::Input {
+                return Err(Error::with_message(
+                    ErrorKind::InvalidInput,
+                    format!("{} is an output device, listed as an input", device.name()),
+                ));
+            }
+        }
+
+        // Outputs first: an input's routing names them, so they have to exist
+        // before it can be resolved.
+        let built_outputs: Vec<EngineOutput<S>> = outputs
+            .into_iter()
+            .zip(output_channels)
+            .map(|(device, channels)| {
+                let output = OutputClass::new(
+                    Some(device.device().clone()),
+                    device.host(),
+                    channels,
+                    sample_rate,
+                    buffer_size,
+                );
+
+                EngineOutput { device, output }
+            })
+            .collect();
+
+        let names: Vec<String> = built_outputs
+            .iter()
+            .map(|output| output.device.name())
+            .collect();
+
+        let built_inputs = inputs
+            .into_iter()
+            .map(|device| {
+                let routes = resolve_routes(&device, &names)?;
+
+                // The callback is a placeholder: carrying captured audio to the
+                // routed outputs is section 2.3's remaining work, and needs a
+                // lock-free hand-off rather than anything that can be done from
+                // inside the audio callback.
+                let mut input = InputClass::new(
+                    Some(device.device().clone()),
+                    device.host(),
+                    sample_rate,
+                    buffer_size,
+                    |_captured: &[S]| {},
+                );
+
+                // The same routing the indices above describe, as devices, so
+                // an `InputClass` driven on its own knows where it is going
+                // without asking the engine.
+                if device.routing().is_some() {
+                    let devices = routes
+                        .iter()
+                        .map(|index| built_outputs[*index].device.device().clone())
+                        .collect();
+                    input.set_routing(Some(devices));
+                }
+
+                Ok(EngineInput {
+                    device,
+                    input,
+                    routes,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        Ok(AudioEngine {
+            inputs: built_inputs,
+            outputs: built_outputs,
+            sample_rate,
+            buffer_size,
+            plugins,
+        })
     }
 
-    /// Push a new audio chunk to be mixed and played.
+    pub fn inputs(&self) -> &[EngineInput<S>] {
+        &self.inputs
+    }
+
+    pub fn inputs_mut(&mut self) -> &mut [EngineInput<S>] {
+        &mut self.inputs
+    }
+
+    pub fn outputs(&self) -> &[EngineOutput<S>] {
+        &self.outputs
+    }
+
+    pub fn outputs_mut(&mut self) -> &mut [EngineOutput<S>] {
+        &mut self.outputs
+    }
+
+    pub fn sample_rate(&self) -> SampleRate {
+        self.sample_rate
+    }
+
+    pub fn buffer_size(&self) -> Option<i32> {
+        self.buffer_size
+    }
+
+    /// The plugins applied to everything.
+    pub fn plugins(&self) -> &[Plugin] {
+        &self.plugins
+    }
+
+    /// Applies the plugins attached to input `index`, in place.
     ///
-    /// The chunk **must** contain exactly `buffer_size * channels` samples
-    /// in interleaved format (L,R,L,R,…). If the queue is full, the chunk is
-    /// dropped and `Err` is returned.
-    pub fn add_samples(&self, samples: Vec<f32>) -> Result<(), &'static str> {
-        // Validate length
-        let expected = self.buffer_size * self.channels;
-        if samples.len() != expected {
-            return Err("chunk length must equal buffer_size * channels");
+    /// This is the input's own chain and nothing else — the engine-wide chain
+    /// runs later, in [`apply_engine_plugins`](Self::apply_engine_plugins), and
+    /// the destination's chain later still. Called before routing, so an input
+    /// heard by several outputs is processed once rather than once per
+    /// destination.
+    ///
+    /// Does nothing if that input has no plugins.
+    pub fn apply_input_plugins(&mut self, index: usize, buffer: &mut [S]) -> Result<(), Error> {
+        let input = self
+            .inputs
+            .get_mut(index)
+            .ok_or_else(|| unknown(index, "input"))?;
+
+        let channels = input.input.channels();
+        for plugin in input.device.plugins_mut() {
+            plugin.apply(buffer, channels)?;
         }
-        // Try to push; if the queue is full, the push returns `false`.
-        if self.queue.push(samples) {
-            Ok(())
-        } else {
-            Err("audio queue is full – chunk dropped")
-        }
+
+        Ok(())
     }
 
-    /// Returns the number of samples currently waiting in the output buffer.
-    /// Useful for monitoring.
-    pub fn output_buffer_len(&self) -> usize {
-        self.output_buffer.len()
+    /// Applies the plugins attached to output `index`, in place.
+    ///
+    /// The last chain to run, and the narrowest: it hears what this device is
+    /// about to play and nothing that goes anywhere else.
+    pub fn apply_output_plugins(&mut self, index: usize, buffer: &mut [S]) -> Result<(), Error> {
+        let output = self
+            .outputs
+            .get_mut(index)
+            .ok_or_else(|| unknown(index, "output"))?;
+
+        let channels = output.output.channels();
+        for plugin in output.device.plugins_mut() {
+            plugin.apply(buffer, channels)?;
+        }
+
+        Ok(())
+    }
+
+    /// Applies the engine-wide plugins, in place.
+    ///
+    /// These were handed to [`new`](Self::new) directly rather than attached to
+    /// a device, so they hear everything — every input, on its way to every
+    /// output. `channels` says how `buffer` is laid out, since the engine's
+    /// devices do not agree on one count.
+    pub fn apply_engine_plugins(
+        &mut self,
+        buffer: &mut [S],
+        channels: u16,
+    ) -> Result<(), Error> {
+        for plugin in &mut self.plugins {
+            plugin.apply(buffer, channels)?;
+        }
+
+        Ok(())
+    }
+
+    /// Runs every chain that applies to audio captured on input `index` and
+    /// bound for output `to`, in the order they belong in.
+    ///
+    /// The order is the point of having three levels: the input's own
+    /// processing happens where the audio is still one source, the engine's in
+    /// the middle, and the destination's last, when it is what that device will
+    /// actually play.
+    pub fn apply_plugins(
+        &mut self,
+        index: usize,
+        to: usize,
+        buffer: &mut [S],
+        channels: u16,
+    ) -> Result<(), Error> {
+        self.apply_input_plugins(index, buffer)?;
+        self.apply_engine_plugins(buffer, channels)?;
+        self.apply_output_plugins(to, buffer)
     }
 }
 
-impl Drop for AudioEngine {
-    fn drop(&mut self) {
-        // Dropping the stream stops the audio callback.
-        // The mixer thread will exit when the `queue` is dropped
-        // (since we hold the last Arc).
-        if let Some(stream) = self._stream.take() {
-            drop(stream);
-        }
-        println!("AudioEngine stopped.");
+impl<S: SampleType> std::fmt::Debug for EngineInput<S> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EngineInput")
+            .field("device", &self.device.name())
+            .field("channels", &self.input.channels())
+            .field("plugins", &self.device.plugins().len())
+            .field("routes", &self.routes)
+            .finish()
     }
+}
+
+impl<S: SampleType> std::fmt::Debug for EngineOutput<S> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EngineOutput")
+            .field("device", &self.device.name())
+            .field("channels", &self.output.channels())
+            .field("plugins", &self.device.plugins().len())
+            .finish()
+    }
+}
+
+/// Reports the wiring rather than the streams: which devices, how many channels
+/// each, and what routes where. None of the cpal types underneath have `Debug`,
+/// and none of them would say anything useful if they did.
+impl<S: SampleType> std::fmt::Debug for AudioEngine<S> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AudioEngine")
+            .field("sample_rate", &self.sample_rate)
+            .field("buffer_size", &self.buffer_size)
+            .field("inputs", &self.inputs)
+            .field("outputs", &self.outputs)
+            .field("plugins", &self.plugins.len())
+            .finish()
+    }
+}
+
+/// Turns an input's routing names into indices into the output list.
+///
+/// Resolved once, here, so that the audio path is an index lookup rather than a
+/// string comparison, and so a name that matches nothing is caught while there
+/// is still somewhere sensible to report it.
+fn resolve_routes(device: &AtomeDevice, outputs: &[String]) -> Result<Vec<usize>, Error> {
+    let Some(routing) = device.routing() else {
+        // No routing named: this input feeds everything.
+        return Ok((0..outputs.len()).collect());
+    };
+
+    routing
+        .iter()
+        .map(|wanted| {
+            outputs
+                .iter()
+                .position(|name| name == wanted)
+                .ok_or_else(|| {
+                    Error::with_message(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "{} is routed to {wanted:?}, which is not one of the outputs",
+                            device.name()
+                        ),
+                    )
+                })
+        })
+        .collect()
+}
+
+fn unknown(index: usize, what: &str) -> Error {
+    Error::with_message(
+        ErrorKind::InvalidInput,
+        format!("no {what} at index {index}"),
+    )
 }

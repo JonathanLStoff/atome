@@ -1,6 +1,6 @@
 [package]
 name = "atome" # Must be unique across all of crates.io
-version = "0.1.0"
+version = "0.8.0"
 edition = "2021"
 authors = ["Jonathan Stoff <JonathanLStoff@gmail.com>"]
 
@@ -31,6 +31,42 @@ vst3-host = { version = "0.9.0", optional = true, default-features = false, feat
 # AU feature:
 truce-rack-au = { version = "1.1.5", optional = true, default-features = false}
 
+# --- Audio import ---
+# Everything below is pulled in by an `import*` feature and by nothing else.
+
+# The pure-Rust half of `import`, and the reason the module splits container
+# from encoding: Symphonia does the same, so one demuxer feeds several decoders.
+# Covers PCM (WAV/AIFF/CAF), MP3, AAC-LC, Vorbis, FLAC, and ALAC, plus the MP4,
+# Matroska, and Ogg demuxers needed to reach them.
+#
+# `default-features = false` keeps out what no feature asked for — notably the
+# metadata readers and the SIMD paths, which can be turned back on deliberately.
+symphonia = { version = "0.6.0", optional = true, default-features = false, features = [
+    "aac",
+    "aiff",
+    "alac",
+    "caf",
+    "flac",
+    "isomp4",
+    "mkv",
+    "mp3",
+    "ogg",
+    "pcm",
+    "vorbis",
+    "wav",
+] }
+
+# HE-AAC v1 and v2. Symphonia's own AAC decoder is LC only — SBR and PS are not
+# in it — so the high band and parametric stereo need libfdk-aac behind it.
+# C library, and its licence is not one to ship without reading.
+symphonia-adapter-fdk-aac = { version = "0.2.0", optional = true }
+
+# Opus. Chosen over `audiopus` because it implements Symphonia's decoder trait,
+# so it drops into the same pipeline as everything above instead of being a
+# second, differently-shaped decoder. Its default `bundled` feature builds
+# libopus from source rather than expecting one on the system.
+symphonia-adapter-libopus = { version = "0.3.0", optional = true }
+
 [features]
 default = []
 
@@ -49,12 +85,42 @@ asio = ["cpal/asio"]
 # backend so far; `vst3` and `au` compile scaffolding and nothing more until one
 # is chosen and added as an optional dependency above.
 
-# Steinberg VST 2.4 plugin hosting, via the `vst` crate.
-vst = ["dep:vst"]
+# Steinberg VST 2.4 plugin hosting.
+#
+# No dependency yet: the `vst` crate is not declared above, so this compiles
+# `plugins::vst` (doc comments only) and nothing else. Add `dep:vst` here when
+# a backend goes in — and read up on the VST 2 SDK licence first, since
+# Steinberg no longer issues one.
+vst = []
 # Steinberg VST 3 plugin hosting, via the `vst3-host` crate.
 vst3 = ["dep:vst3-host"]
 # Apple Audio Unit (v2/v3) plugin hosting. macOS/iOS only.
 au = ["dep:truce-rack-au"]
-
 # Convenience: every plugin format at once.
 plugins = ["vst", "vst3", "au"]
+
+# --- Audio import ---
+# Reading audio in from a file. Split by what a build has to link against, not
+# by format: `import` on its own stays pure Rust and needs no toolchain beyond
+# cargo, while each codec that only exists as a C library is its own opt-in.
+
+# PCM (WAV, AIFF, CAF), MP3, AAC-LC, Vorbis, FLAC, ALAC — and the MP4,
+# Matroska, and Ogg demuxing to get at them.
+import = ["dep:symphonia"]
+
+# HE-AAC v1 and v2, via libfdk-aac. Not pure Rust. Without this, an HE-AAC file
+# is still identified correctly and still fails to decode, rather than being
+# quietly decoded as plain LC and sounding wrong.
+import-he-aac = ["import", "dep:symphonia-adapter-fdk-aac"]
+
+# Opus, via libopus. Not pure Rust: builds the C library from source, so it
+# needs a C compiler.
+import-opus = ["import", "dep:symphonia-adapter-libopus"]
+
+# Every format that has a working decoder today.
+import-all = ["import", "import-he-aac", "import-opus"]
+
+# No feature for AC-3, E-AC-3, DTS, DTS-HD MA, Dolby TrueHD, WMA, or AMR: none
+# of them has a Rust decoder to point a feature at. `import::Encoding` still
+# names them and identification still recognises them, so the failure is a
+# clear "no decoder" rather than a misread file. See planning/TODO.md.

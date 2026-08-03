@@ -11,7 +11,10 @@ pub mod utils;
 
 pub use mixer::{ClearSignal, MixCommand, Mixer, MixerHandle};
 pub use types::{OutputType, SampleRate, SampleType};
-pub use utils::{default_device, find_device, list_device_names, list_devices, device_name};
+pub use utils::{
+    default_device, device_name, find_device, get_host_by_id, get_host_by_name, get_host_in_name,
+    list_device_names, list_devices, list_hosts,
+};
 
 /// Frames assumed when the caller asks for the device's default buffer size.
 /// Only used to size the ring buffer — the stream itself still asks the device
@@ -231,11 +234,20 @@ impl<S: SampleType> OutputClass<S> {
         Ok(index + samples.len())
     }
     /// Schedules interleaved samples for playback at a `time`.
-    /// Time is in secounds from now, so it will delay the start of the audio 
+    /// Time is in secounds from now, so it will delay the start of the audio
+    ///
+    /// The index is `time * sample_rate * channels`, since an index counts
+    /// interleaved samples rather than frames — a stereo second is twice as
+    /// many indices as a mono one.
+    ///
+    /// Note that "from now" is measured from the *start of the stream*, not
+    /// from wherever playback has reached: the mixer's play cursor is not
+    /// visible from here, so calling this after playback has begun schedules
+    /// into the past and the samples are dropped as late. Exposing the cursor
+    /// through [`MixerHandle`] would be the way to make it truly relative.
     pub fn add_samples_time(&mut self, samples: &[S], time: usize) -> Result<usize, Error> {
-        
-        let index = time * self.sample_rate
-        
+        let index = time * self.sample_rate as usize * self.channels.max(1) as usize;
+
         let command = MixCommand {
             index,
             samples: samples.to_vec(),
@@ -267,7 +279,11 @@ impl<S: SampleType> OutputClass<S> {
     pub fn stop(&mut self) {
         self.mixer.clear_samples();
     }
-
+    /// Drops the stream, stopping playback. The output can be re-used by calling
+    /// [`build_stream`](Self::build_stream) again.
+    pub fn close(&mut self) {
+        self.stream.take();
+    }
     /// Handle to the mixer thread feeding this output.
     pub fn mixer(&self) -> &MixerHandle {
         &self.mixer

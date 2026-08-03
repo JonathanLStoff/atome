@@ -28,6 +28,37 @@ pub enum SampleRate {
     Hz352_8 = 352800,
 }
 
+impl SampleRate {
+    /// Every rate this enum names, in ascending order.
+    pub const ALL: [SampleRate; 10] = [
+        SampleRate::Hz8k,
+        SampleRate::Hz11_025k,
+        SampleRate::Hz16k,
+        SampleRate::Hz44_1k,
+        SampleRate::Hz48k,
+        SampleRate::Hz88_2k,
+        SampleRate::Hz96k,
+        SampleRate::Hz176_4k,
+        SampleRate::Hz192k,
+        SampleRate::Hz352_8,
+    ];
+
+    /// The rate as a plain number.
+    pub fn hz(self) -> u32 {
+        self as u32
+    }
+
+    /// The variant for `hz`, or `None` where it is not one of them.
+    ///
+    /// A decoded file states its rate as a number, and an output has to be
+    /// built from one of these — so anything arriving from a decoder passes
+    /// through here, and a `None` is the signal to resample rather than to
+    /// give up.
+    pub fn from_hz(hz: u32) -> Option<Self> {
+        Self::ALL.into_iter().find(|rate| rate.hz() == hz)
+    }
+}
+
 /// # SampleType
 ///
 /// Marker trait for the *real* Rust types a sample can be stored in, so a
