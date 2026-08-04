@@ -21,6 +21,23 @@
 //! | An output's `AtomeDevice` | what that device plays, after mixing |
 //! | [`AudioEngine::new`] directly | everything |
 //!
+//! The shortest one to write is an [internal
+//! plugin](plugins::internal) — a Rust function compiled in, needing no
+//! feature and nothing installed on the machine:
+//!
+//! ```
+//! use atome::Plugin;
+//!
+//! let quieter = Plugin::internal("-6 dB", |buffer: &mut [f32], _channels| {
+//!     for sample in buffer {
+//!         *sample *= 0.5;
+//!     }
+//! });
+//! ```
+//!
+//! VST 3 and Audio Units are hosted too, each behind its own feature. See
+//! [`plugins`] for the full table.
+//!
 //! ```no_run
 //! use atome::{device::AtomeDevice, AudioEngine};
 //! use atome::output::{OutputType, SampleRate};

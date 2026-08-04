@@ -26,10 +26,12 @@ Ordered roughly by what unblocks what. Nothing below is started unless marked.
 - Capture stream (`InputClass<S>`), mirroring the output
 - `AudioEngine` over many devices, with routing and three levels of plugin chain
 
-**Scaffolding only (no implementation):** `src/plugins/internal.rs`,
-`src/plugins/vst.rs`, `src/plugins/vst3.rs`, `src/plugins/au.rs` — and every
-`Plugin::apply`, which passes audio through untouched until a host backend
-exists
+- Plugin hosting: internal (Rust functions), VST3, and AU v2/v3, all through
+  one `Plugin::apply`
+
+**Scaffolding only (no implementation):** `src/plugins/vst.rs` — VST2 has no
+backend crate to host through, and `Plugin::load` refuses the format rather
+than pretending otherwise
 
 ---
 
@@ -115,7 +117,8 @@ different audio depending on where it is attached.
       device plays and nothing else
 - [x] Stub the apply step at all three levels, so the ordering is settled
       before any host backend exists
-- [ ] Real processing, once [section 11](#11-plugin-hosting) has a backend
+- [x] Real processing — internal, VST3, and AU all process for real; see
+      [section 11](#11-plugin-hosting)
 - [ ] Bypass and wet/dry per plugin
 - [ ] Latency reporting from a chain, feeding delay compensation
 
@@ -376,19 +379,32 @@ Currently nothing beyond `mix` and linear interpolation.
 
 ## 11. Plugin hosting
 
-All four format modules are docs and nothing else.
+Internal, VST3, and AU (v2 and v3) load and process. Everything below the
+first block is still open.
 
-- [ ] Common `HostedPlugin` trait so formats are interchangeable at the call site
-- [ ] Plugin scanning: filesystem walk, per-platform standard paths, cached index
+- [x] Internal plugins: a Rust function mapped in at load, applied per block,
+      with a name registry so a chain can be described by configuration
+- [x] Common hosting path so formats are interchangeable at the call site —
+      `plugins::host::Hosted`, over `truce-rack-core`'s traits
+- [x] VST3 hosting: scan, instantiate, activate, process
+- [x] AU hosting (macOS/iOS), v2 and v3
+- [ ] Plugin scanning as a first-class API: filesystem walk, per-platform
+      standard paths, cached index. Loading scans one path today, which is
+      enough to load a known plugin and not enough to browse
 - [ ] Out-of-process scanning so a bad plugin can't take down the scan
-- [ ] VST3 hosting: instantiate, activate, process, parameter and bus handling
-- [ ] AU hosting (macOS/iOS), v2 and v3
-- [ ] VST2 hosting (note the SDK licensing problem before shipping)
+- [ ] Parameter and bus handling — `params` on the descriptor is still an
+      unparsed `String` and reaches no plugin
+- [ ] Re-activation when the channel count or block size changes, rather than
+      the current error
+- [ ] VST2 hosting — no backend crate exists and the SDK licence is unresolved;
+      `PluginFormat::Vst` refuses on every build until both change
 - [ ] CLAP hosting — modern, permissively licensed, no SDK obligations
 - [ ] LV2 hosting (Linux reach)
 - [ ] Plugin state save/restore and preset switching
 - [ ] Parameter enumeration, automation, and host↔plugin notification
-- [ ] Latency reporting from plugins into the graph's compensation
+- [ ] Latency reporting from plugins into the graph's compensation. Internal
+      plugins declare theirs; the hosted formats report zero because
+      `truce-rack-core` exposes no latency on its traits
 - [ ] Bus/channel-layout negotiation
 - [ ] Sandboxed/bridged hosting (crash isolation, 32↔64-bit bridging)
 - [ ] Editor lifecycle hooks — the window is the GUI layer's problem, but

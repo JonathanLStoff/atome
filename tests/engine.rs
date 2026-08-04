@@ -7,21 +7,27 @@ use std::path::PathBuf;
 
 use atome::device::{AtomeDevice, Direction};
 use atome::output::{OutputType, SampleRate};
+use atome::plugins::PluginFormat;
 use atome::{AudioEngine, Plugin};
 
 fn host() -> OutputType {
     if cfg!(target_os = "windows") { OutputType::WASAPI } else { OutputType::CoreAudio }
 }
 
+/// A plugin descriptor that is never loaded.
+///
+/// These tests are about the engine's wiring, not about hosting: an unloaded
+/// plugin passes audio through, which is all a reach test needs it to do.
 fn plugin(name: &str) -> Plugin {
-    Plugin {
-        name: name.to_string(),
-        path: PathBuf::from("/nonexistent"),
-        buffer_size: 512,
-        sample_rate: 48_000,
-        channels: 2,
-        params: String::new(),
-    }
+    Plugin::new(
+        name.to_string(),
+        PathBuf::from("/nonexistent"),
+        512,
+        48_000,
+        2,
+        String::new(),
+        PluginFormat::Internal,
+    )
 }
 
 /// Two outputs and one input, or `None` where the machine has no devices.

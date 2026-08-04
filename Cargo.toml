@@ -19,17 +19,22 @@ cpal = "0.18.1"
 ringbuf = "0.5.1"
 
 
-# Pulled in by the `vst3` feature. Its default `cpal-backend` is off: atome owns
-# the cpal stream, so vst3-host's own playback backend would be dead weight
-# (it wants cpal 0.18 too, so there is no version conflict either way).
-# `process-isolation` is kept — it runs plugins out-of-process so a crashing
-# one can't take the host down.
-vst3-host = { version = "0.9.0", optional = true, default-features = false, features = [
-    "process-isolation",
-] }
+# --- Plugin hosting ---
+# The truce-rack family: one crate of shared traits, one per plugin format. Any
+# host format pulls in `truce-rack-core`, since that is where `Plugin`,
+# `PluginScanner`, and `AudioBuffer` live — the vocabulary `plugins::Plugin`
+# speaks to every backend through.
+#
+# Internal plugins need none of this: they are Rust functions, so that path
+# stays available in a build with no plugin feature on at all.
+truce-rack-core = { version = "1.1.5", optional = true, default-features = false }
 
-# AU feature:
-truce-rack-au = { version = "1.1.5", optional = true, default-features = false}
+# VST3 hosting. All platforms.
+truce-rack-vst3 = { version = "1.1.5", optional = true, default-features = false }
+
+# AU v2 and v3 are Apple frameworks. Their crates are declared further down,
+# under `[target.'cfg(target_vendor = "apple")'.dependencies]`, so a Linux or
+# Windows build never pulls in their objc2 tree.
 
 # --- Audio import ---
 # Everything below is pulled in by an `import*` feature and by nothing else.
@@ -67,6 +72,17 @@ symphonia-adapter-fdk-aac = { version = "0.2.0", optional = true }
 # libopus from source rather than expecting one on the system.
 symphonia-adapter-libopus = { version = "0.3.0", optional = true }
 
+# Audio Unit hosting, v2 and v3. Apple-only, and declared per-target rather
+# than merely feature-gated so that off-target builds do not have to resolve or
+# compile the objc2 bindings underneath them.
+#
+# `truce-rack-au3` scans for v3 App Extensions but hands the resulting
+# `AudioComponentInstance` back to `truce-rack-au`'s `AuPlugin` to hold, which
+# is why the `au3` feature turns on both crates.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+truce-rack-au = { version = "1.1.5", optional = true, default-features = false }
+truce-rack-au3 = { version = "1.1.5", optional = true, default-features = false }
+
 [features]
 default = []
 
@@ -81,23 +97,31 @@ default = []
 asio = ["cpal/asio"]
 
 # --- Plugin formats ---
-# Each one gates the matching module under `plugins`. Only `vst` has a hosting
-# backend so far; `vst3` and `au` compile scaffolding and nothing more until one
-# is chosen and added as an optional dependency above.
+# Each one gates the matching module under `plugins`. Internal plugins are not
+# in this list on purpose: they are plain Rust functions with nothing to link
+# against, so `plugins::internal` is always compiled in.
 
 # Steinberg VST 2.4 plugin hosting.
 #
-# No dependency yet: the `vst` crate is not declared above, so this compiles
-# `plugins::vst` (doc comments only) and nothing else. Add `dep:vst` here when
-# a backend goes in — and read up on the VST 2 SDK licence first, since
-# Steinberg no longer issues one.
+# No dependency yet, and no backend: truce-rack has no VST2 crate, and the
+# `vst` crate on crates.io is unmaintained. This compiles `plugins::vst` (doc
+# comments only) and nothing else. Read up on the VST 2 SDK licence before
+# leaning on it either way — Steinberg no longer issues one.
 vst = []
-# Steinberg VST 3 plugin hosting, via the `vst3-host` crate.
-vst3 = ["dep:vst3-host"]
-# Apple Audio Unit (v2/v3) plugin hosting. macOS/iOS only.
-au = ["dep:truce-rack-au"]
+
+# Steinberg VST 3 plugin hosting, via `truce-rack-vst3`.
+vst3 = ["dep:truce-rack-vst3", "dep:truce-rack-core"]
+
+# Apple Audio Unit v2 hosting, via `truce-rack-au`. macOS/iOS only — on any
+# other target the dependency is not declared and the module is not compiled.
+au = ["dep:truce-rack-au", "dep:truce-rack-core"]
+
+# Apple Audio Unit v3 (App Extension) hosting, via `truce-rack-au3`. Scanning
+# is v3's own; the loaded instance is `truce-rack-au`'s `AuPlugin`, hence both.
+au3 = ["dep:truce-rack-au3", "dep:truce-rack-au", "dep:truce-rack-core"]
+
 # Convenience: every plugin format at once.
-plugins = ["vst", "vst3", "au"]
+plugins = ["vst", "vst3", "au", "au3"]
 
 # --- Audio import ---
 # Reading audio in from a file. Split by what a build has to link against, not
