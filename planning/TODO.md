@@ -46,9 +46,7 @@ The crate builds. What is left here is documentation and CI.
 - [x] `src/output/mod.rs`: `add_samples_time` compiles — but see its doc
       comment, "from now" still measures from the start of the stream
 - [x] `src/output/utils.rs`: `list_device_names` and `find_device` pass `None`
-- [ ] `README.md` documents an API that does not exist (`Engine`, `Sample`,
-      `Voice`, `Bus`, format features). Reconcile — it currently reads as a
-      promise, not a description
+- [x] `README.md` describes the crate that exists rather than one that does not
 - [ ] CI that actually builds and tests (badge points at a workflow with no
       file; `.github/workflows/publish.yml` covers releases only)
 - [x] Test suite: `tests/` covers import, decoding, input, and engine wiring
@@ -136,7 +134,10 @@ different audio depending on where it is attached.
 
 ## 3. Audio file I/O
 
-The README advertises this; none of it exists.
+Decoding works today through Symphonia (see `src/import/`). What follows is the
+architecture that would replace it — demuxer split from decoder, one format at a
+time — plus every format Symphonia does not cover, and writing, which does not
+exist at all.
 
 ### 3.1 Infrastructure
 

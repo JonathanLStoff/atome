@@ -8,6 +8,17 @@ underneath it, so **Done** always holds exactly what is unreleased.
 
 **Done**
 
+- `README.md` rewritten to describe the crate that exists. The old one promised
+  an async `Engine`/`Sample`/`Voice`/`Bus` API and a set of `wav`/`flac`/`mp3`
+  format features, none of which were ever written; the new one covers
+  `AudioEngine`, `AtomeDevice`, `OutputClass`/`InputClass`, the three plugin
+  levels, the built-in effects, and `import`, with the real feature names and a
+  status section that says plainly what is missing — chiefly that the engine
+  does not yet carry captured audio from an input to its outputs. Every snippet
+  in it compiles. The CI badge is gone: it pointed at a workflow with no file
+- `planning/TODO.md` section 3 no longer says audio file I/O does not exist —
+  decoding has worked through Symphonia since 0.8.0; what is left there is the
+  demuxer/decoder split, the formats Symphonia misses, and encoding
 - Internal plugins (`plugins::internal`): a Rust function mapped in at load and
   run by `Plugin::apply`. `Plugin::internal` takes the function directly;
   `internal::register` names one so a chain can be described by configuration
