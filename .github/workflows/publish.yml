@@ -38,6 +38,19 @@ jobs:
         with:
           fetch-depth: 0
 
+      # cpal's Linux backend is ALSA, and `alsa-sys` finds it through
+      # pkg-config rather than vendoring it — so without `alsa.pc` on the
+      # runner its build script panics before any of this crate is compiled.
+      # The GitHub images do not carry the development headers.
+      #
+      # There is no way around it by turning features off: cpal needs a host
+      # backend, and on Linux that is this one.
+      - name: Install ALSA development headers
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libasound2-dev pkg-config
+
       - name: Install the stable toolchain
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
