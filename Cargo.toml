@@ -11,7 +11,12 @@ repository = "https://github.com/jonathanlstoff/atome"
 readme = "README.md"
 
 keywords = ["audio", "async", "engine", "samples", "decode"]
-categories = ["Multimedia", "Encoding"] 
+
+# crates.io category *slugs*, which are lowercase and `::`-separated — not the
+# display names. An unrecognised one is rejected at upload with a 400, after
+# the crate has been packaged, so it is worth checking against
+# https://crates.io/category_slugs before adding one.
+categories = ["multimedia::audio", "multimedia::encoding"]
 
 [dependencies]
 atomic-queue = "2.2.0"

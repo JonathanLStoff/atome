@@ -102,6 +102,70 @@ jobs:
 
           echo "name=$name" >> "$GITHUB_OUTPUT"
 
+      # `cargo publish --dry-run` never contacts the registry, so it cannot see
+      # a category crates.io will not take. That comes back as a 400 at upload,
+      # after everything has been built and packaged — the last step in the
+      # job, and the one place a failure is most annoying. This moves it to the
+      # front.
+      #
+      # The comparison has to be exact. Looking a category up is
+      # case-insensitive, so `Multimedia` resolves happily to `multimedia` and
+      # a 200 proves nothing; publishing wants the canonical spelling, and that
+      # is what the response body carries.
+      - name: Check the category slugs
+        run: |
+          set -euo pipefail
+
+          declared="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[0].categories[]?')"
+
+          if [ -z "$declared" ]; then
+            echo "no categories declared; nothing to check"
+            exit 0
+          fi
+
+          bad=0
+          while IFS= read -r slug; do
+            [ -n "$slug" ] || continue
+
+            response="$(curl -sS \
+              -H "User-Agent: ${{ github.repository }} release workflow" \
+              -w '\n%{http_code}' \
+              "https://crates.io/api/v1/categories/$slug")" || {
+                echo "::warning::could not reach crates.io to check '$slug'"
+                continue
+              }
+
+            status="$(printf '%s' "$response" | tail -n1)"
+            body="$(printf '%s' "$response" | sed '$d')"
+
+            case "$status" in
+              200)
+                canonical="$(printf '%s' "$body" | jq -r '.category.slug')"
+                if [ "$canonical" != "$slug" ]; then
+                  echo "::error::category '$slug' has to be written '$canonical'"
+                  bad=1
+                fi
+                ;;
+              404)
+                echo "::error::'$slug' is not a crates.io category"
+                bad=1
+                ;;
+              *)
+                # Same reasoning as the published-version check below: a
+                # registry that will not answer is not evidence of a problem.
+                echo "::warning::crates.io answered $status for '$slug'; not checked"
+                ;;
+            esac
+          done <<< "$declared"
+
+          if [ "$bad" -ne 0 ]; then
+            echo "The full list is at https://crates.io/category_slugs"
+            exit 1
+          fi
+
+          echo "categories ok"
+
       # Re-running a workflow, or pushing again to the same branch, should not
       # fail on a version that is already out there.
       #
