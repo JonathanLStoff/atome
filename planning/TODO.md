@@ -101,9 +101,21 @@ three levels and each has a different reach.
 - [x] Resolve names to output indices once, at construction, and fail on a name
       that matches nothing
 - [ ] Carry captured audio from the input callback to its outputs — a lock-free
-      hand-off per route, drained off the audio thread
-- [ ] Convert between an input's channel count and each output's on the way
+      hand-off per route, drained off the audio thread. `examples/live_thru.rs`
+      does this by hand over an `mpsc` channel and is the shape to start from;
+      what it cannot do from outside is schedule against the play cursor
+- [ ] Expose the mixer's play cursor through `MixerHandle`, so a forwarder can
+      schedule relative to playback instead of estimating from the wall clock
+      (see `live_thru`'s open-loop scheduling, and `add_samples_time`'s note)
+- [ ] Convert between an input's channel count and each output's on the way.
+      `OutputClass::align_samples` already does the mapping; the engine does
+      not yet call it on the routing path
 - [ ] Gain per route
+- [ ] A post-mix plugin level. An output's chain is meant to hear what the
+      device plays, which with two sources means hearing them mixed — and the
+      summing happens past `add_samples`, where no caller can reach it. See
+      `examples/mix_sources.rs`, which leaves that level empty rather than
+      applying it per source
 
 ### 2.4 Plugin chains
 
@@ -366,16 +378,25 @@ Currently nothing beyond `mix` and linear interpolation.
 - [ ] dB↔linear, pan laws, gain smoothing, interpolation, denormal helpers
 - [ ] Fixed-size SIMD-friendly buffer types
 
-## 10. Built-in effects (`plugins::internal`)
+## 10. Built-in effects (`plugins::atome`)
 
-- [ ] Gain / trim / phase invert
-- [ ] EQ (parametric, graphic)
-- [ ] Compressor / limiter / gate
-- [ ] Delay, chorus, flanger, phaser
-- [ ] Reverb
-- [ ] Distortion / saturation
-- [ ] Stereo width, mid/side encode/decode
-- [ ] Metering taps that don't alter the signal
+Fourteen, all parameterised through `Params` and buildable by name.
+
+- [x] Gain / trim
+- [x] EQ — three-band shelf/peak/shelf, plus a resonant `filter`
+- [x] Compressor / limiter / gate
+- [x] Delay, chorus, flanger
+- [x] Reverb — Schroeder combs into all-passes, Freeverb proportions
+- [x] Saturation (`tanh`)
+- [x] Stereo width (mid/side), pan, tremolo
+- [ ] Phaser — the one from the original list still missing
+- [ ] Phase invert
+- [ ] Graphic EQ, and a parametric with more than three bands
+- [ ] Metering taps that don't alter the signal. Needs a way for a plugin to
+      report back, which the `Effect` trait has no shape for yet
+- [ ] Look-ahead limiting. The current one has no delay to look down, so a
+      transient is over the ceiling for the sample before the detector reacts
+- [ ] Oversampling for the non-linear ones, which alias as drive goes up
 
 ## 11. Plugin hosting
 
@@ -392,8 +413,12 @@ first block is still open.
       standard paths, cached index. Loading scans one path today, which is
       enough to load a known plugin and not enough to browse
 - [ ] Out-of-process scanning so a bad plugin can't take down the scan
-- [ ] Parameter and bus handling — `params` on the descriptor is still an
-      unparsed `String` and reaches no plugin
+- [x] Parameter handling — `Params` is one name/value vocabulary for every
+      format, and `Plugin::new`'s `params` string is parsed and applied on load
+- [ ] Bus handling beyond the symmetric main bus: sidechains and auxiliaries
+      are declared by plugins and nothing here asks for them
+- [ ] Parameter automation, and change notification from a plugin's own UI back
+      to the host
 - [ ] Re-activation when the channel count or block size changes, rather than
       the current error
 - [ ] VST2 hosting — no backend crate exists and the SDK licence is unresolved;
@@ -498,8 +523,13 @@ keeping it.
 - [ ] Fuzzing for file decoders and MIDI/SysEx parsers
 - [ ] Cross-platform CI (macOS/Windows/Linux) across the feature matrix
 - [ ] `#![deny(missing_docs)]` and a doc pass on public API
-- [ ] Examples that compile and run: playback, capture, effect chain, plugin host
-- [ ] Semantic versioning discipline and a changelog
+- [x] Examples that compile and run: playback (`play_file`), effect chain
+      (`play_effects`), capture and monitoring (`live_thru`), two sources into
+      one output (`mix_sources`), and engine wiring (`audio_engine1`..`4`)
+- [ ] An example that hosts a real VST3 or AU, rather than only internal
+      plugins. Needs a plugin present on the machine, so it cannot be one of
+      the ones `make examples` runs unattended
+- [x] Semantic versioning discipline and a changelog
 
 ---
 

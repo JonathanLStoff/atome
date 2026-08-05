@@ -14,9 +14,11 @@ use truce_rack_core::{
     bus::BusLayout,
     error::{Error as CoreError, Result as CoreResult},
     events::EventList,
+    info::ParameterFlags,
     plugin::{Plugin as CorePlugin, PluginCore, ProcessContext, ProcessStatus},
 };
 
+use super::params::{ParamError, ParamSpec, Params, Value};
 use crate::output::SampleType;
 
 /// A loaded plugin, activated and with the scratch space its blocks need.
@@ -94,6 +96,140 @@ where
             max_block,
             channels,
         })
+    }
+
+    // -------------------------------------------------------------------------
+    //  Parameters
+    // -------------------------------------------------------------------------
+
+    /// The plugin's parameters, described in its own units.
+    ///
+    /// Skips the ones the plugin asked to hide and the read-only meters — the
+    /// first are not the host's business and the second cannot be set, so
+    /// listing either as settable would be a lie.
+    pub(crate) fn param_schema(&self) -> Vec<ParamSpec> {
+        (0..self.plugin.parameter_count())
+            .filter_map(|index| self.plugin.parameter_info(index).ok())
+            .filter(|info| !info.flags.intersects(ParameterFlags::HIDDEN | ParameterFlags::READ_ONLY))
+            .map(|info| {
+                // A one-step parameter is a switch however the format spells
+                // it, and describing it as a toggle is what lets `true` be
+                // written where the plugin wants a 1.
+                let toggle = info.step_count == 1
+                    || info.flags.contains(ParameterFlags::BYPASS);
+
+                if toggle {
+                    ParamSpec::toggle(&info.name, info.default != info.min, &info.unit)
+                } else {
+                    ParamSpec::number(
+                        &info.name,
+                        &info.unit,
+                        info.min,
+                        info.max,
+                        info.default,
+                        "",
+                    )
+                }
+            })
+            .collect()
+    }
+
+    /// Every parameter's current value, by name.
+    pub(crate) fn params(&self) -> Params {
+        (0..self.plugin.parameter_count())
+            .filter_map(|index| {
+                let info = self.plugin.parameter_info(index).ok()?;
+                if info
+                    .flags
+                    .intersects(ParameterFlags::HIDDEN | ParameterFlags::READ_ONLY)
+                {
+                    return None;
+                }
+                let value = self.plugin.parameter_value(index).ok()?;
+                Some((info.name, Value::Number(value)))
+            })
+            .collect()
+    }
+
+    /// Sets parameters by the names the plugin reports.
+    ///
+    /// Names rather than indices, because an index is not stable across plugin
+    /// versions and is not something anyone would write in a configuration
+    /// file. The lookup is a linear scan over the parameter list, which is
+    /// fine: this is not on the audio path, and the alternative is a cache
+    /// that has to be invalidated when the plugin reloads.
+    ///
+    /// Resolved in full before anything is written, so a set that names one
+    /// parameter the plugin does not have changes none of them — the same
+    /// all-or-nothing guarantee the built-ins give.
+    ///
+    /// What that cannot cover is the plugin refusing a write it already
+    /// accepted the look of. Nothing here can undo a `set_parameter` that
+    /// succeeded before a later one failed, so that case is reported and the
+    /// earlier writes stand.
+    ///
+    /// # Errors
+    ///
+    /// [`ParamError::Unknown`] for a name this plugin does not have, listing
+    /// the ones it does; [`ParamError::Range`] for a value outside what the
+    /// parameter declares.
+    pub(crate) fn set_params(&mut self, params: &Params) -> Result<(), ParamError> {
+        if params.is_empty() {
+            return Ok(());
+        }
+
+        let schema = self.param_schema();
+
+        // Resolve and check everything first.
+        let mut writes = Vec::with_capacity(params.len());
+        for (key, value) in params.iter() {
+            let Some((index, spec)) = self.find(key, &schema) else {
+                return Err(ParamError::Unknown {
+                    key: key.to_string(),
+                    known: schema.into_iter().map(|spec| spec.name).collect(),
+                });
+            };
+            writes.push((key.to_string(), index, spec.check(value)?));
+        }
+
+        for (key, index, number) in writes {
+            self.plugin.set_parameter(index, number).map_err(|error| {
+                ParamError::Unsupported {
+                    message: format!("could not set '{key}': {error}"),
+                }
+            })?;
+        }
+
+        Ok(())
+    }
+
+    /// The index and spec of the parameter called `key`.
+    ///
+    /// Exact match first, then case-insensitively — plugin parameter names are
+    /// display strings written for a UI ("Dry/Wet", "Attack Time"), and asking
+    /// a caller to reproduce a vendor's capitalisation exactly is a poor trade
+    /// against the small chance of two names differing only in case.
+    fn find(&self, key: &str, schema: &[ParamSpec]) -> Option<(usize, ParamSpec)> {
+        let position = schema
+            .iter()
+            .position(|spec| spec.name == key)
+            .or_else(|| {
+                schema
+                    .iter()
+                    .position(|spec| spec.name.eq_ignore_ascii_case(key))
+            })?;
+
+        // `param_schema` filters, so its indices are not the plugin's. Map
+        // back through the name.
+        let name = &schema[position].name;
+        let index = (0..self.plugin.parameter_count()).find(|index| {
+            self.plugin
+                .parameter_info(*index)
+                .map(|info| &info.name == name)
+                .unwrap_or(false)
+        })?;
+
+        Some((index, schema[position].clone()))
     }
 
     /// Runs one interleaved block through the plugin, in place.

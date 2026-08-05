@@ -16,7 +16,18 @@
 //!
 //! [Internal plugins](internal) are behind no feature because there is nothing
 //! to link against: they are Rust functions compiled into the host, and the
-//! shortest path to a working chain.
+//! shortest path to a working chain. [`atome`] has a set already written —
+//! compressor, delay, reverb, EQ, and the rest:
+//!
+//! ```
+//! use ::atome::plugins::{atome, ParamError};
+//!
+//! let compressor = atome::compressor(48_000)
+//!     .with_params("threshold_db: -18, ratio: 4, attack_ms: 5")?;
+//! # Ok::<(), ParamError>(())
+//! ```
+//!
+//! Or write one, when none of those is the thing:
 //!
 //! ```
 //! use atome::plugins::Plugin;
@@ -32,6 +43,26 @@
 //! [`Plugin::new`], call [`Plugin::load`] once off the audio thread, then
 //! [`Plugin::apply`] per block.
 //!
+//! # Parameters
+//!
+//! One vocabulary for every format — see [`params`]. A built-in matches names
+//! against its own fields, a VST3 or AU against the parameter names the plugin
+//! reports, and the call is the same either way:
+//!
+//! ```
+//! use ::atome::plugins::{atome, ParamError};
+//!
+//! let mut reverb = atome::reverb(48_000);
+//! reverb.set_params_str(r#"{ "room_size": 0.8, "mix": 0.25 }"#)?;
+//!
+//! // And back out again, in a form `set_params_str` reads.
+//! let saved = reverb.params().to_string();
+//! # Ok::<(), ParamError>(())
+//! ```
+//!
+//! Which means a whole chain can be described by data rather than by code:
+//! [`Plugin::new`] takes a parameter string, and [`Plugin::load`] applies it.
+//!
 //! # Where a plugin runs
 //!
 //! Attaching is separate from loading — see
@@ -46,7 +77,9 @@ use cpal::{Error, ErrorKind};
 
 use crate::output::SampleType;
 
+pub mod atome;
 pub mod internal;
+pub mod params;
 
 #[cfg(all(feature = "au", target_vendor = "apple"))]
 pub mod au;
@@ -65,7 +98,9 @@ pub mod vst3;
 ))]
 mod host;
 
+pub use atome::Effect;
 pub use internal::InternalPlugin;
+pub use params::{ParamError, ParamKind, ParamSpec, Params, Value};
 
 /// Whether a hosted format is compiled into this build.
 ///
@@ -287,15 +322,38 @@ impl Plugin {
         }
 
         self.inner = Some(match format {
+            // The registry first, so registering a name shadows a built-in of
+            // the same one rather than the other way round: a caller who
+            // registers "compressor" meant theirs.
             PluginFormat::Internal => {
-                let plugin = internal::get(&self.name).ok_or_else(|| {
-                    format!(
-                        "no internal plugin registered as '{}' — register one with \
-                         atome::plugins::internal::register, or build it directly with \
-                         Plugin::internal",
-                        self.name
-                    )
-                })?;
+                let plugin = match internal::get(&self.name) {
+                    Some(plugin) => plugin,
+                    None => {
+                        let built_in = atome::create(
+                            &self.name,
+                            self.sample_rate as u32,
+                            &Params::new(),
+                        )
+                        .map_err(|_| {
+                            format!(
+                                "'{}' is neither a registered internal plugin nor one of the \
+                                 built-ins ({}). Register one with \
+                                 atome::plugins::internal::register, or build it directly with \
+                                 Plugin::internal",
+                                self.name,
+                                atome::kinds().join(", "),
+                            )
+                        })?;
+
+                        // `create` hands back a loaded `Plugin`; this needs the
+                        // instance out of it.
+                        match built_in.inner {
+                            Some(PluginInner::Internal(plugin)) => plugin,
+                            _ => unreachable!("a built-in is always an internal plugin"),
+                        }
+                    }
+                };
+
                 PluginInner::Internal(plugin)
             }
 
@@ -338,6 +396,14 @@ impl Plugin {
             #[allow(unreachable_patterns)]
             other => return Err(other.unavailable().into()),
         });
+
+        // The descriptor's own parameters, now that there is something to
+        // apply them to. Last, so a plugin that loads but will not take its
+        // parameters reports that rather than a loading failure.
+        if !self.params.trim().is_empty() {
+            let params = Params::parse(&self.params)?;
+            self.set_params(&params)?;
+        }
 
         Ok(())
     }
@@ -416,14 +482,198 @@ impl Plugin {
     /// another puts them out of phase with each other.
     ///
     /// Internal plugins report what they declared through
-    /// [`InternalPlugin::with_latency`]. The hosted formats report zero —
-    /// `truce-rack-core` exposes no latency on its plugin traits, so there is
-    /// nothing to ask. Read a zero from a VST3 or an AU as "not implemented",
-    /// not as "no delay".
+    /// [`InternalPlugin::with_latency`], or what their [`Effect`] reports. The
+    /// hosted formats report zero — `truce-rack-core` exposes no latency on its
+    /// plugin traits, so there is nothing to ask. Read a zero from a VST3 or an
+    /// AU as "not implemented", not as "no delay".
     pub fn latency(&self) -> usize {
         match &self.inner {
             Some(PluginInner::Internal(plugin)) => plugin.latency(),
             _ => 0,
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    //  Parameters
+    // -------------------------------------------------------------------------
+
+    /// What parameters this plugin has, and what they accept.
+    ///
+    /// Empty for a plugin that is not loaded, and for one built from a bare
+    /// closure — a closure has no parameters to describe. A
+    /// [built-in](atome) describes its own; a hosted plugin's comes from the
+    /// format, with the names it uses in its own UI.
+    ///
+    /// Hosted ranges are the plugin's native units where the format reports
+    /// them, so a VST3 that thinks in `0.0..=1.0` is described that way rather
+    /// than being scaled to something more readable.
+    pub fn param_schema(&self) -> Vec<ParamSpec> {
+        match &self.inner {
+            None => Vec::new(),
+            Some(PluginInner::Internal(plugin)) => {
+                plugin.effect().map(Effect::schema).unwrap_or_default()
+            }
+
+            #[cfg(all(feature = "au", target_vendor = "apple"))]
+            Some(PluginInner::Au(plugin)) => plugin.param_schema(),
+            #[cfg(all(feature = "au3", target_vendor = "apple", not(feature = "au")))]
+            Some(PluginInner::Au3(plugin)) => plugin.param_schema(),
+            #[cfg(feature = "vst3")]
+            Some(PluginInner::Vst3(plugin)) => plugin.param_schema(),
+        }
+    }
+
+    /// Every parameter's current value.
+    ///
+    /// The output round-trips: `plugin.set_params(&plugin.params())` is a no-op,
+    /// and `plugin.params().to_string()` is a parameter string
+    /// [`set_params_str`](Self::set_params_str) will read back. That is what
+    /// makes saving a chain's settings to a file a two-line job.
+    pub fn params(&self) -> Params {
+        match &self.inner {
+            None => Params::new(),
+            Some(PluginInner::Internal(plugin)) => {
+                plugin.effect().map(atome::params_of).unwrap_or_default()
+            }
+
+            #[cfg(all(feature = "au", target_vendor = "apple"))]
+            Some(PluginInner::Au(plugin)) => plugin.params(),
+            #[cfg(all(feature = "au3", target_vendor = "apple", not(feature = "au")))]
+            Some(PluginInner::Au3(plugin)) => plugin.params(),
+            #[cfg(feature = "vst3")]
+            Some(PluginInner::Vst3(plugin)) => plugin.params(),
+        }
+    }
+
+    /// Sets parameters by name.
+    ///
+    /// The same call whatever the plugin is: a [built-in](atome) matches the
+    /// names against its own fields, a hosted plugin against the parameter
+    /// names the format reports.
+    ///
+    /// Not for the audio thread — it is not slow, but nothing guarantees a
+    /// hosted plugin's own `set_parameter` is lock-free.
+    ///
+    /// # Errors
+    ///
+    /// - [`ParamError::Unknown`] for a name the plugin does not have. The
+    ///   message lists the names it does.
+    /// - [`ParamError::Type`] or [`ParamError::Range`] for a value it will not
+    ///   take.
+    /// - [`ParamError::Unsupported`] if the plugin is not loaded — there is
+    ///   nothing to set parameters on until it is.
+    ///
+    /// All or nothing: every name and value is checked before any of them is
+    /// written, so a set naming one parameter the plugin does not have leaves
+    /// the rest untouched rather than applying half of them.
+    pub fn set_params(&mut self, params: &Params) -> Result<(), ParamError> {
+        match &mut self.inner {
+            None => {
+                if params.is_empty() {
+                    return Ok(());
+                }
+                Err(ParamError::Unsupported {
+                    message: format!(
+                        "'{}' is not loaded, so it has no parameters to set — call load() first",
+                        self.name
+                    ),
+                })
+            }
+
+            Some(PluginInner::Internal(plugin)) => match plugin.effect_mut() {
+                Some(effect) => atome::apply(effect, params),
+                None if params.is_empty() => Ok(()),
+                None => Err(ParamError::Unsupported {
+                    message: format!(
+                        "'{}' is a plain function, which has no parameters. Build it from an \
+                         Effect — see atome::plugins::atome — if it needs them",
+                        self.name
+                    ),
+                }),
+            },
+
+            #[cfg(all(feature = "au", target_vendor = "apple"))]
+            Some(PluginInner::Au(plugin)) => plugin.set_params(params),
+            #[cfg(all(feature = "au3", target_vendor = "apple", not(feature = "au")))]
+            Some(PluginInner::Au3(plugin)) => plugin.set_params(params),
+            #[cfg(feature = "vst3")]
+            Some(PluginInner::Vst3(plugin)) => plugin.set_params(params),
+        }
+    }
+
+    /// Sets one parameter.
+    ///
+    /// ```
+    /// use ::atome::plugins::{atome, ParamError};
+    ///
+    /// let mut compressor = atome::compressor(48_000);
+    /// compressor.set_param("ratio", 8.0)?;
+    /// compressor.set_param("threshold_db", -24)?;
+    /// # Ok::<(), ParamError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`set_params`](Self::set_params).
+    pub fn set_param(
+        &mut self,
+        key: &str,
+        value: impl Into<Value>,
+    ) -> Result<(), ParamError> {
+        self.set_params(&Params::new().with(key, value))
+    }
+
+    /// Sets parameters from a [parameter string](params).
+    ///
+    /// ```
+    /// use ::atome::plugins::{atome, ParamError};
+    ///
+    /// let mut delay = atome::delay(48_000);
+    /// delay.set_params_str(r#"{ "time_ms": 375, "feedback": 0.4 }"#)?;
+    /// # Ok::<(), ParamError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`ParamError::Syntax`] if the string will not parse, then as
+    /// [`set_params`](Self::set_params).
+    pub fn set_params_str(&mut self, params: &str) -> Result<(), ParamError> {
+        self.set_params(&Params::parse(params)?)
+    }
+
+    /// Sets parameters and returns `self`, for building a chain inline.
+    ///
+    /// ```
+    /// use ::atome::plugins::{atome, ParamError};
+    ///
+    /// let chain = vec![
+    ///     atome::gate(48_000).with_params("threshold_db: -45")?,
+    ///     atome::compressor(48_000).with_params("ratio: 4, threshold_db: -18")?,
+    ///     atome::limiter(48_000).with_params("ceiling_db: -1")?,
+    /// ];
+    /// # Ok::<(), ParamError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`set_params_str`](Self::set_params_str).
+    pub fn with_params(mut self, params: &str) -> Result<Self, ParamError> {
+        self.set_params_str(params)?;
+        Ok(self)
+    }
+
+    /// Drops whatever state the plugin has built up, leaving its parameters.
+    ///
+    /// A delay's line, a filter's history, a compressor's envelope. Worth doing
+    /// when a chain is reused for unrelated audio, so the last of the previous
+    /// material does not ring into the new.
+    ///
+    /// Only [built-ins](atome) answer this. A plugin built from a closure keeps
+    /// any state inside the closure where this cannot reach, and the hosted
+    /// formats expose no reset short of deactivating.
+    pub fn reset(&mut self) {
+        if let Some(PluginInner::Internal(plugin)) = &mut self.inner {
+            plugin.reset();
         }
     }
 }
@@ -436,7 +686,7 @@ impl Plugin {
 /// allocated per block, which is an allocation on the audio thread and the
 /// one thing here that is not yet good enough for a small buffer.
 fn apply_internal<S: SampleType>(
-    plugin: &InternalPlugin,
+    plugin: &mut InternalPlugin,
     buffer: &mut [S],
     channels: u16,
 ) -> Result<(), Error> {
@@ -649,7 +899,112 @@ mod tests {
     fn an_unregistered_name_is_an_error() {
         let mut plugin = descriptor("nothing registered under this", PluginFormat::Internal);
         let error = plugin.load().expect_err("not registered");
-        assert!(error.to_string().contains("no internal plugin registered"));
+        let message = error.to_string();
+
+        assert!(message.contains("nothing registered under this"), "{message}");
+        // And it says what the built-ins are, since one of them is the likely
+        // thing that was meant.
+        assert!(message.contains("compressor"), "{message}");
+    }
+
+    #[test]
+    fn a_built_in_loads_by_name() {
+        let mut plugin = descriptor("compressor", PluginFormat::Internal);
+        plugin.load().expect("compressor is a built-in");
+
+        assert!(plugin.is_loaded());
+        assert_eq!(plugin.params().number("ratio"), Some(4.0));
+    }
+
+    #[test]
+    fn a_registered_name_shadows_a_built_in() {
+        internal::register("reverb", |buffer: &mut [f32], _| buffer.fill(0.25));
+
+        let mut plugin = descriptor("reverb", PluginFormat::Internal);
+        plugin.load().expect("registered");
+
+        // The registered function, not the built-in reverb.
+        let mut buffer = [0.0_f32; 4];
+        plugin.apply(&mut buffer, 2).expect("processes");
+        assert_eq!(buffer, [0.25; 4]);
+
+        internal::unregister("reverb");
+    }
+
+    #[test]
+    fn the_descriptors_parameters_are_applied_on_load() {
+        let mut plugin = Plugin::new(
+            "delay".into(),
+            PathBuf::new(),
+            512,
+            48_000,
+            2,
+            r#"{ "time_ms": 375, "feedback": 0.6 }"#.into(),
+            PluginFormat::Internal,
+        );
+
+        plugin.load().expect("a built-in with parameters");
+
+        assert_eq!(plugin.params().number("time_ms"), Some(375.0));
+    }
+
+    #[test]
+    fn bad_parameters_in_the_descriptor_fail_the_load() {
+        let mut plugin = Plugin::new(
+            "delay".into(),
+            PathBuf::new(),
+            512,
+            48_000,
+            2,
+            "time_ms: 999999".into(),
+            PluginFormat::Internal,
+        );
+
+        let error = plugin.load().expect_err("999999 ms is outside the range");
+        assert!(error.to_string().contains("time_ms"), "{error}");
+    }
+
+    #[test]
+    fn a_plain_function_has_no_parameters_to_set() {
+        let mut plugin = Plugin::internal("noop", |_: &mut [f32], _| {});
+
+        assert!(plugin.params().is_empty());
+        assert!(plugin.param_schema().is_empty());
+
+        // Setting none of them is fine; setting one is not.
+        assert!(plugin.set_params(&Params::new()).is_ok());
+        assert!(matches!(
+            plugin.set_param("anything", 1.0),
+            Err(ParamError::Unsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn an_unloaded_plugin_has_nothing_to_set_parameters_on() {
+        let mut plugin = descriptor("not loaded", PluginFormat::Vst3);
+
+        assert!(plugin.params().is_empty());
+        assert!(matches!(
+            plugin.set_param("ratio", 4.0),
+            Err(ParamError::Unsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn parameters_round_trip_through_a_string() {
+        let mut original = atome::reverb(48_000);
+        original
+            .set_params_str("room_size: 0.8, damping: 0.3, mix: 0.45")
+            .expect("valid");
+
+        // What `params()` prints is what `set_params_str` reads, which is what
+        // makes saving a chain to a file a two-line job.
+        let saved = original.params().to_string();
+
+        let mut restored = atome::reverb(48_000);
+        restored.set_params_str(&saved).expect("its own output");
+
+        assert_eq!(restored.params(), original.params(), "saved as {saved}");
     }
 
     #[test]

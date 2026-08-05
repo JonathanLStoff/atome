@@ -39,3 +39,38 @@ underneath it, so **Done** always holds exactly what is unreleased.
   `## Release x.y.z` section
 - `publish.yml` tags the published commit `v<version>` and opens a GitHub release
   for it after the crates.io upload
+- Three whole-pipeline examples, all audible: `play_effects` (decode → plugin
+  chain → device, block by block so stateful plugins are seen to keep their
+  state), `live_thru` (microphone → all three plugin levels → device, live), and
+  `mix_sources` (a file and a microphone summed by the mixer into one output).
+  `make example-effects`, `make example-thru`, `make example-mix`
+- `examples/common::shared_rate` picks a sample rate two devices agree on.
+  Opening a device at a rate it does not support is not a hard failure in cpal —
+  it reports through the stream's error callback and runs at its own rate, which
+  is a confusing thing to find by ear
+- `examples/audio_engine4` runs real plugins instead of pass-through stubs, and
+  prints the gain products so the chain order is visible
+- `plugins::atome`: fourteen built-in effects — gain, pan, width, filter, eq,
+  compressor, limiter, gate, saturation, tremolo, delay, chorus, flanger, and
+  reverb. Each is a Rust `Effect` with named parameters, built directly
+  (`atome::compressor(48_000)`) or by name (`atome::create("delay", rate,
+  &params)`) so a chain can be described by configuration
+- `plugins::params`: one parameter vocabulary for every format. `Params` is a
+  name/value map parsed from a flat JSON object — braces, quotes, and a
+  trailing comma all optional — and `Plugin::set_params`, `set_param`,
+  `set_params_str`, `with_params`, `params`, and `param_schema` speak it
+  whatever the plugin is. A built-in matches names against its own fields; a
+  VST3 or AU matches against the parameter names the plugin reports
+- Parameter sets are all-or-nothing: every name and value is checked before any
+  is written, so a set naming one parameter the plugin lacks changes none
+- `Plugin::new`'s `params` string is no longer inert — `load` parses and applies
+  it, and a bad value fails the load rather than being ignored
+- `Plugin::load` builds a built-in by name when nothing is registered under it,
+  so `Plugin::new("compressor", …, "ratio: 4", Internal)` works with no code
+- `Effect`, behind `InternalPlugin::from_effect`, for writing an effect that
+  carries parameters. Cloning one gives a fresh instance with the same
+  parameters and no state — two devices with "the same" compressor should not
+  share an envelope follower
+- `Plugin::reset` drops a built-in's accumulated state, leaving its parameters
+- `examples/play_effects` builds its chain from a name-and-parameter-string
+  table rather than hand-rolled closures, and prints each plugin's parameters

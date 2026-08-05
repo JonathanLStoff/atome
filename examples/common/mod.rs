@@ -10,7 +10,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use atome::output::{device_name, OutputType};
+use atome::output::{device_name, OutputType, SampleRate};
 use atome::{AudioEngine, SampleType};
 
 /// The host API to tag devices with on this platform.
@@ -115,4 +115,64 @@ pub fn note_no_audio() {
 /// Names a device, for printing.
 pub fn name_of(device: &cpal::Device) -> String {
     device_name(device)
+}
+
+/// A sample rate both devices will run at, preferring what they already use.
+///
+/// An engine has one rate for every stream on it, so a capture device and a
+/// playback device that disagree have to be talked into agreeing. Opening a
+/// device at a rate it does not support is not a hard failure in cpal — it
+/// reports "device sample rate changed" through the stream's error callback
+/// and carries on at its own rate, which is a confusing thing to debug by ear.
+///
+/// Preference order: the output's default rate (the one the machine is already
+/// running at, so nothing has to be reconfigured), then the input's, then 48 k
+/// and 44.1 k as the two most likely to be supported anywhere.
+pub fn shared_rate(input: &cpal::Device, output: &cpal::Device) -> SampleRate {
+    use cpal::traits::DeviceTrait;
+
+    let default_of = |config: Result<cpal::SupportedStreamConfig, _>| {
+        config
+            .ok()
+            .and_then(|config| SampleRate::from_hz(config.sample_rate()))
+    };
+
+    let candidates = [
+        default_of(output.default_output_config()),
+        default_of(input.default_input_config()),
+        Some(SampleRate::Hz48k),
+        Some(SampleRate::Hz44_1k),
+    ];
+
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|rate| supports(input, *rate, false) && supports(output, *rate, true))
+        .unwrap_or(SampleRate::Hz48k)
+}
+
+/// Whether a device declares a config covering `rate`.
+///
+/// A device that will not answer at all counts as supporting nothing, which
+/// pushes `shared_rate` on to its next candidate rather than settling on a rate
+/// nothing was checked against.
+fn supports(device: &cpal::Device, rate: SampleRate, output: bool) -> bool {
+    use cpal::traits::DeviceTrait;
+
+    let hz = rate.hz() as cpal::SampleRate;
+    let covers = |config: &cpal::SupportedStreamConfigRange| {
+        config.min_sample_rate() <= hz && hz <= config.max_sample_rate()
+    };
+
+    if output {
+        device
+            .supported_output_configs()
+            .map(|mut configs| configs.any(|config| covers(&config)))
+            .unwrap_or(false)
+    } else {
+        device
+            .supported_input_configs()
+            .map(|mut configs| configs.any(|config| covers(&config)))
+            .unwrap_or(false)
+    }
 }

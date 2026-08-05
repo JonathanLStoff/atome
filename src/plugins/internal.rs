@@ -61,6 +61,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, OnceLock, RwLock};
 
+use super::atome::Effect;
+
 /// What an internal plugin does to a block of audio.
 ///
 /// `buffer` is interleaved by `channels`, so frame `f` of channel `c` lives at
@@ -74,14 +76,34 @@ use std::sync::{Arc, OnceLock, RwLock};
 /// blocks goes behind the function's own interior mutability.
 pub type ProcessFn = dyn Fn(&mut [f32], u16) + Send + Sync + 'static;
 
-/// A named processing function, ready to be applied.
+/// What an internal plugin actually is.
 ///
-/// Cheap to clone — the function itself is shared, not copied — which is what
-/// lets one registered plugin be attached to several devices.
+/// Two shapes, because they want opposite things from a clone. A bare function
+/// has no state worth separating, so sharing it is free and cloning a plugin
+/// that holds one gives another handle on the same function. An [`Effect`] has
+/// state — a filter's history, a delay's line — and two attachments of "the
+/// same" effect should be two effects, so it is owned rather than shared and a
+/// clone gets a fresh one.
+enum Body {
+    Function(Arc<ProcessFn>),
+    Effect(Box<dyn Effect>),
+}
+
+impl Clone for Body {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Function(function) => Self::Function(Arc::clone(function)),
+            // Parameters carried over, state left behind.
+            Self::Effect(effect) => Self::Effect(effect.duplicate()),
+        }
+    }
+}
+
+/// A named processing function or [`Effect`], ready to be applied.
 #[derive(Clone)]
 pub struct InternalPlugin {
     name: String,
-    process: Arc<ProcessFn>,
+    body: Body,
     latency: usize,
 }
 
@@ -96,8 +118,43 @@ impl InternalPlugin {
     {
         Self {
             name: name.into(),
-            process: Arc::new(process),
+            body: Body::Function(Arc::new(process)),
             latency: 0,
+        }
+    }
+
+    /// Wraps an [`Effect`] up as a plugin.
+    ///
+    /// The route every [built-in](super::atome) takes. An effect brings its own
+    /// parameters, so a plugin built this way answers
+    /// [`Plugin::params`](super::Plugin::params) and
+    /// [`Plugin::set_params`](super::Plugin::set_params) rather than reporting
+    /// that it has none.
+    ///
+    /// Latency comes from the effect itself and is not overridable — an effect
+    /// knows what it delays by; a caller does not.
+    pub fn from_effect(name: impl Into<String>, effect: impl Effect) -> Self {
+        let latency = effect.latency();
+        Self {
+            name: name.into(),
+            body: Body::Effect(Box::new(effect)),
+            latency,
+        }
+    }
+
+    /// The effect behind this plugin, if it is one rather than a function.
+    pub(crate) fn effect(&self) -> Option<&dyn Effect> {
+        match &self.body {
+            Body::Effect(effect) => Some(effect.as_ref()),
+            Body::Function(_) => None,
+        }
+    }
+
+    /// As [`effect`](Self::effect), for setting parameters.
+    pub(crate) fn effect_mut(&mut self) -> Option<&mut dyn Effect> {
+        match &mut self.body {
+            Body::Effect(effect) => Some(effect.as_mut()),
+            Body::Function(_) => None,
         }
     }
 
@@ -123,11 +180,26 @@ impl InternalPlugin {
         self.latency
     }
 
-    /// Runs the function over one block.
+    /// Runs one block through, in place.
     ///
-    /// `buffer` is interleaved by `channels` and is processed in place.
-    pub fn process(&self, buffer: &mut [f32], channels: u16) {
-        (self.process)(buffer, channels)
+    /// `buffer` is interleaved by `channels`. Takes `&mut self` because an
+    /// [`Effect`] keeps state between blocks; a plugin built from a plain
+    /// function does not touch it.
+    pub fn process(&mut self, buffer: &mut [f32], channels: u16) {
+        match &mut self.body {
+            Body::Function(function) => function(buffer, channels),
+            Body::Effect(effect) => effect.process(buffer, channels),
+        }
+    }
+
+    /// Drops whatever state an [`Effect`] has built up, leaving its parameters.
+    ///
+    /// Nothing to do for a plugin built from a function: any state it keeps is
+    /// inside the closure, where this cannot reach.
+    pub fn reset(&mut self) {
+        if let Body::Effect(effect) = &mut self.body {
+            effect.reset();
+        }
     }
 }
 
@@ -206,10 +278,11 @@ pub fn registered() -> Vec<String> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     #[test]
     fn processes_in_place() {
-        let plugin = InternalPlugin::new("double", |buffer: &mut [f32], _| {
+        let mut plugin = InternalPlugin::new("double", |buffer: &mut [f32], _| {
             for sample in buffer {
                 *sample *= 2.0;
             }
@@ -225,7 +298,7 @@ mod tests {
     fn sees_the_interleaving() {
         // Silences every channel but the first, which is only possible if the
         // function is told how the buffer is interleaved.
-        let plugin = InternalPlugin::new("left only", |buffer: &mut [f32], channels| {
+        let mut plugin = InternalPlugin::new("left only", |buffer: &mut [f32], channels| {
             for frame in buffer.chunks_mut(channels as usize) {
                 for sample in &mut frame[1..] {
                     *sample = 0.0;
@@ -252,7 +325,7 @@ mod tests {
             buffer.fill(1.0);
         });
 
-        let found = get("registry round trip").expect("just registered");
+        let mut found = get("registry round trip").expect("just registered");
         let mut buffer = [0.0; 3];
         found.process(&mut buffer, 1);
         assert_eq!(buffer, [1.0; 3]);
@@ -263,14 +336,45 @@ mod tests {
     }
 
     #[test]
+    fn state_survives_a_block_boundary() {
+        // A one-pole filter, the smallest plugin whose output depends on the
+        // block before it. Processing in pieces has to give the same answer as
+        // processing in one go — otherwise every block edge is a click, and
+        // the examples that filter a decoded file block by block are wrong.
+        let filter = || {
+            let previous = Mutex::new(0.0_f32);
+            InternalPlugin::new("one-pole", move |buffer: &mut [f32], _| {
+                let mut previous = previous.lock().unwrap_or_else(|e| e.into_inner());
+                for sample in buffer {
+                    *previous += 0.1 * (*sample - *previous);
+                    *sample = *previous;
+                }
+            })
+        };
+
+        let input: Vec<f32> = (0..64).map(|n| (n as f32 * 0.1).sin()).collect();
+
+        let mut whole = input.clone();
+        filter().process(&mut whole, 1);
+
+        let mut blocked = input;
+        let mut piecewise = filter();
+        for block in blocked.chunks_mut(7) {
+            piecewise.process(block, 1);
+        }
+
+        assert_eq!(whole, blocked);
+    }
+
+    #[test]
     fn a_clone_shares_the_function() {
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
 
-        let plugin = InternalPlugin::new("counter", move |_: &mut [f32], _| {
+        let mut plugin = InternalPlugin::new("counter", move |_: &mut [f32], _| {
             counter.fetch_add(1, Ordering::Relaxed);
         });
-        let clone = plugin.clone();
+        let mut clone = plugin.clone();
 
         plugin.process(&mut [], 1);
         clone.process(&mut [], 1);

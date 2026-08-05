@@ -10,8 +10,10 @@
 # of them for every example.
 
 CARGO ?= cargo
-# Passed through to the playback example: make example-play FILE=~/song.flac
+# Passed through to the playback examples: make example-play FILE=~/song.flac
 FILE ?=
+# How long the live monitoring example runs: make example-thru SECONDS=30
+SECONDS ?=
 # The version to cut: make release v=0.9.0
 v ?=
 
@@ -20,7 +22,8 @@ v ?=
 PROFILE ?= --release
 
 .DEFAULT_GOAL := help
-.PHONY: help examples example1 example2 example3 example4 example-play \
+.PHONY: help examples example1 example2 example3 example4 \
+        example-play example-play-all example-effects example-thru example-mix \
         build build-all test check doc clean release \
         require-cargo require-manifest require-import require-native require-fixture \
         require-version
@@ -126,6 +129,27 @@ example-play-all: require-import require-native require-fixture
 	@echo "==> play_file with every decoder (builds libopus and libfdk-aac)"
 	$(CARGO) run $(PROFILE) --features import-all --example play_file -- $(FILE)
 
+# --- whole-pipeline examples ----------------------------------------------
+# Every one of these makes sound. The two that open a microphone say so twice,
+# here and on stdout, because monitoring a mic through a speaker feeds back.
+
+## example-effects: file -> plugin chain -> speakers. Makes sound. Needs import
+example-effects: require-import require-fixture
+	@echo "==> play_effects: decode, run a plugin chain over it, play it"
+	$(CARGO) run $(PROFILE) --features import --example play_effects -- $(FILE)
+
+## example-thru: microphone -> plugin chains -> speakers, live. WEAR HEADPHONES
+example-thru: require-manifest
+	@echo "==> live_thru: monitor a microphone through all three plugin levels"
+	@echo "    wear headphones — this feeds a microphone into a speaker"
+	$(CARGO) run $(PROFILE) --example live_thru -- $(SECONDS)
+
+## example-mix: a file and a microphone into one output. WEAR HEADPHONES
+example-mix: require-import require-fixture
+	@echo "==> mix_sources: a file and a microphone summed by the mixer"
+	@echo "    wear headphones — this feeds a microphone into a speaker"
+	$(CARGO) run $(PROFILE) --features import --example mix_sources -- $(FILE)
+
 ## examples: every example that needs no particular hardware and makes no sound
 examples: example1 example2 example3 example4
 
@@ -228,6 +252,12 @@ help:
 		| sed -e 's/^## //' -e 's/:/:|/' \
 		| awk -F'|' '{ printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2 }'
 	@echo ""
-	@echo "  Only 'example-play' makes any sound. The engine examples build real"
-	@echo "  streams and print how they are wired; carrying captured audio from an"
-	@echo "  input to its outputs is not implemented yet (planning/TODO.md 2.3)."
+	@echo "  The 'example-*' targets make sound; 'example1'..'example4' do not —"
+	@echo "  they build real streams and print how they are wired."
+	@echo ""
+	@echo "  'example-thru' and 'example-mix' open a microphone and play it back."
+	@echo "  Wear headphones: through a speaker that is a feedback loop."
+	@echo ""
+	@echo "  The engine does not yet carry captured audio from an input to its"
+	@echo "  outputs (planning/TODO.md 2.3); the live examples do that forwarding"
+	@echo "  themselves, and say so."
