@@ -48,7 +48,7 @@ dependencies = [
 
 [[package]]
 name = "atome"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "atomic-queue",
  "cpal",

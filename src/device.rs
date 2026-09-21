@@ -18,6 +18,7 @@
 //! ```
 
 use cpal::Device;
+use cpal::DeviceId;
 
 use crate::input;
 use crate::output::{self, device_name, OutputType};
@@ -43,6 +44,7 @@ pub struct AtomeDevice {
     host: OutputType,
     plugins: Vec<Plugin>,
     routing: Option<Vec<String>>,
+    pub device_id: DeviceId,
 }
 
 impl AtomeDevice {
@@ -67,12 +69,38 @@ impl AtomeDevice {
     }
 
     fn new(device: Device, direction: Direction, host: OutputType) -> Self {
+        use cpal::traits::DeviceTrait;
+
+        let device_id = match device.id() {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("Failed to get device ID: {}", e);
+                eprintln!("Falling back to device name-based ID");
+                let name = device_name(&device);
+                let name_hash = {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = DefaultHasher::new();
+                    name.hash(&mut hasher);
+                    format!("{:x}", hasher.finish())
+                };
+                #[cfg(target_vendor = "apple")]
+                let fallback_host = cpal::platform::HostId::CoreAudio;
+                #[cfg(target_os = "linux")]
+                let fallback_host = cpal::platform::HostId::Alsa;
+                #[cfg(target_os = "windows")]
+                let fallback_host = cpal::platform::HostId::Wasapi;
+                DeviceId::new(fallback_host, name_hash)
+            }
+        };
+
         AtomeDevice {
             device,
             direction,
             host,
             plugins: Vec::new(),
             routing: None,
+            device_id,
         }
     }
 
@@ -140,6 +168,7 @@ impl std::fmt::Debug for AtomeDevice {
         formatter
             .debug_struct("AtomeDevice")
             .field("name", &self.name())
+            .field("device_id", &self.device_id)
             .field("direction", &self.direction)
             .field("host", &self.host)
             .field("plugins", &self.plugins.len())
