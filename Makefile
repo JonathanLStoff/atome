@@ -16,6 +16,10 @@ FILE ?=
 SECONDS ?=
 # The version to cut: make release v=0.9.0
 v ?=
+# `make docker-test` only: which systems, of debian ubuntu fedora alpine
+# windows-cross android macos windows. Empty means every one this host can run.
+# Not called OS, which Windows already sets for every program.
+SYSTEMS ?=
 
 # Anything that reads or writes audio devices is release-built by default:
 # a debug-built decoder is slow enough to underrun on a small buffer.
@@ -23,8 +27,8 @@ PROFILE ?= --release
 
 .DEFAULT_GOAL := help
 .PHONY: help examples example1 example2 example3 example4 \
-        example-play example-play-all example-effects example-thru example-mix \
-        build build-all test check doc clean release \
+        example-play example-play-all example-to-flac example-effects example-thru example-mix \
+        build build-all test fixtures docker-test check doc clean release \
         require-cargo require-manifest require-import require-native require-fixture \
         require-version
 
@@ -124,6 +128,10 @@ example-play: require-import require-fixture
 	@echo "==> play_file: decode and play (this one you can hear)"
 	$(CARGO) run $(PROFILE) --features import --example play_file -- $(FILE)
 
+## example-to-flac: decode a file's audio - a video's soundtrack too - into FLAC (make example-to-flac FILE=clip.mp4)
+example-to-flac: require-import require-fixture
+	$(CARGO) run $(PROFILE) --features import,export --example to_flac -- $(FILE)
+
 ## example-play-all: as above, with the C-backed decoders (Opus, HE-AAC)
 example-play-all: require-import require-native require-fixture
 	@echo "==> play_file with every decoder (builds libopus and libfdk-aac)"
@@ -164,9 +172,17 @@ build-all: require-import
 	$(CARGO) build $(PROFILE) --examples
 	$(CARGO) build $(PROFILE) --features import --examples
 
-## test: run the test suite with decoding enabled
+## test: run the test suite with decoding and FLAC writing enabled
 test: require-import
-	$(CARGO) test --features import
+	$(CARGO) test --features import,export
+
+## fixtures: make every decode-test fixture with ffmpeg, so none of those tests skips
+fixtures:
+	sh tests/test_data/make_fixtures.sh
+
+## docker-test: the test matrix in a container per OS, and natively on a Mac (make docker-test SYSTEMS="debian alpine")
+docker-test:
+	sh docker/run.sh $(SYSTEMS)
 
 ## check: compile-check every feature combination that does not need C tooling
 check: require-import

@@ -134,10 +134,11 @@ different audio depending on where it is attached.
 
 ## 3. Audio file I/O
 
-Decoding works today through Symphonia (see `src/import/`). What follows is the
-architecture that would replace it — demuxer split from decoder, one format at a
-time — plus every format Symphonia does not cover, and writing, which does not
-exist at all.
+Decoding works today through Symphonia (see `src/import/`), and FLAC writing
+through `flacenc` (see `src/export/`). What follows is the architecture that
+would replace the decoding — demuxer split from decoder, one format at a time —
+plus every format Symphonia does not cover, and every format beyond FLAC that
+could be written.
 
 ### 3.1 Infrastructure
 
@@ -179,6 +180,23 @@ exist at all.
 - [ ] **MP3 (`.mp3`)** — MPEG-1/2/2.5 Layer III; CBR, VBR (Xing/VBRI/LAME
       headers), free-format; ID3v1/v2 skipping; encoder delay + padding
 - [ ] **MP1 / MP2 (`.mp2`)** — still standard in broadcast
+- [ ] **AAC through the OS decoder, never a bundled one** (decided 2026-09-26).
+      atome goes into paid software, and a bundled AAC decoder raises the same
+      patent question vtome avoids for H.264 by using the OS's — with the OS
+      decoder, the licence is the OS vendor's:
+      - [ ] macOS/iOS: AudioToolbox (`AudioConverter`), which also covers
+            HE-AAC v1/v2
+      - [ ] Windows: Media Foundation's AAC decoder
+      - [ ] Android: MediaCodec
+      - [ ] Linux: there is no OS AAC decoder to lean on. Decide — a distro's
+            GStreamer, or no AAC on Linux — and write the answer down
+      - [ ] Take `aac` out of Symphonia's features under `import`, so the
+            bundled decoder is not compiled at all. Symphonia's MP4 and Matroska
+            demuxers stay and hand their AAC packets to the OS decoder
+      - [ ] Retire `import-he-aac` (libfdk-aac): the OS decoders cover HE-AAC,
+            and the FDK licence grants no patent rights
+      - [ ] OrbitX turns on `import-all`, which includes `import-he-aac`, so it
+            ships both bundled AAC decoders today
 - [ ] **AAC** — LC, HE-AAC v1 (SBR), HE-AAC v2 (SBR+PS), plus:
   - [ ] ADTS framing (`.aac`) — raw stream, self-describing frames
   - [ ] ADIF — single global header, rare
@@ -207,7 +225,9 @@ exist at all.
 ### 3.5 Encoding / writing
 
 - [ ] WAV (all PCM widths) and RF64 for long captures
-- [ ] FLAC encoding for lossless bounce
+- [ ] FLAC above 24 bits. `flacenc` stops at 24, so 32-bit integer sources lose
+      their bottom 8 bits on export (everything lossy decodes to float and is
+      written at 24, which loses nothing it had)
 - [ ] AIFF and CAF writing
 - [ ] Opus and Vorbis encoding for compressed export
 - [ ] MP3 encoding — check the encoder's licence before shipping it
@@ -304,6 +324,12 @@ gets audio out of most video files without one new decoder.
 - [ ] **15. Multi-track and multi-channel output.** MXF and broadcast files carry
       discrete mono tracks that belong together; offer both "extract one track"
       and "extract and combine into one layout"
+- [ ] **AAC in video files goes through the OS decoder** — most audio in video
+      files is AAC, and `export::to_flac` has to use §3.3's OS path rather
+      than Symphonia's bundled decoder
+- [ ] Trim AAC priming in video files: a 3.000 s clip from ffmpeg comes out of
+      `to_flac` 3.021 s long — 1024 frames of encoder delay the MP4's edit list
+      says to drop (step 10 above)
 
 ### 4.3 Scope note
 
@@ -457,6 +483,11 @@ processor, exported to every format.
 ## 13. Transport, timing, sync
 
 - [ ] Transport: play/stop/record, position in samples/seconds/bars+beats
+- [ ] **The play position of a playing sound, readable from another thread** —
+      what vtome slaves its video clock to (vtome's `MasterClock`), so a video
+      added to vtome plays in sync with its audio here. Position as actually
+      heard, output latency included, and whether it is running (asked for
+      2026-09-24)
 - [ ] Tempo map and time signature, including changes mid-timeline
 - [ ] Musical-time ↔ sample-time conversion
 - [ ] Sample-accurate event scheduling queue with a lookahead window
@@ -517,6 +548,13 @@ keeping it.
 
 ## 19. Quality and release engineering
 
+- [ ] **A Docker image per OS that runs the default toolkit's tests**, each
+      carrying the converters — ffmpeg with MP3, AAC, ALAC, Opus, FLAC — so the
+      decode fixtures are made inside rather than skipped (asked for
+      2026-09-30). **In progress.** The same OS split as vtome's: Linux
+      distributions in containers, Windows under Wine and on a Windows host,
+      Android by NDK cross-build, macOS and iOS by a script on a Mac. A null
+      ALSA device lets the device tests run in a container instead of skipping
 - [ ] Unit tests across mixer, alignment, graph, and DSP
 - [ ] Integration tests with a null/offline device for deterministic runs
 - [ ] Null tests for DSP correctness against reference output

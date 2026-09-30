@@ -8,6 +8,16 @@ underneath it, so **Done** always holds exactly what is unreleased.
 
 **Done**
 
+- **FLAC writing** (`export` feature, pure Rust via `flacenc`). `FlacWriter`
+  encodes one block at a time straight to disk and writes the real STREAMINFO
+  — sample count, MD5, frame sizes — over a placeholder at `finish`, so a
+  two-hour file is never held in memory. `write_flac` writes a `Decoded` at the
+  depth its samples need (8, 16, or 24 bits; 32-bit and float sources at 24).
+  `to_flac` decodes anything `import` reads — the audio track of a video
+  included — straight into FLAC. Lossless round trips at 16 and 24 bits compare
+  equal sample for sample, the short last block included; an H.264+AAC MP4's
+  soundtrack came out as a FLAC that ffmpeg decodes cleanly and whose header
+  MD5 matches the decoded audio. `make example-to-flac FILE=clip.mp4`
 - `README.md` rewritten to describe the crate that exists. The old one promised
   an async `Engine`/`Sample`/`Voice`/`Bus` API and a set of `wav`/`flac`/`mp3`
   format features, none of which were ever written; the new one covers

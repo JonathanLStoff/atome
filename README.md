@@ -46,7 +46,7 @@ be expected until `1.0`.
   hand, and is the shape it will take
 - No sample/voice layer, no signal graph, no buses. `AudioEngine` mixes by
   scheduling into an output, not by walking a graph
-- No audio export or encoding — decoding only
+- Export is FLAC only (`export` feature); nothing lossy is written yet
 - No duplex operation, no drift correction between unsynced device clocks
 - VST 2.4 is a module of documentation and nothing else: there is no maintained
   Rust crate to host through, so `Plugin::load` refuses the format
@@ -260,6 +260,19 @@ on it to avoid a conversion, or call `to_vec::<S>()` when you need one type.
 HE-AAC v1/v2 with `import-he-aac` and Opus with `import-opus`. The MP4, Matroska,
 and Ogg demuxers needed to reach them come with `import`.
 
+### Writing FLAC (`export` feature)
+
+```rust
+use atome::export;
+
+// Anything import reads — a video's soundtrack included — straight to FLAC,
+// a block at a time: 16-bit sources stay 16-bit, lossy ones land at 24.
+let summary = export::to_flac("clip.mp4", "clip.flac")?;
+```
+
+`FlacWriter` writes one block at a time and `write_flac` writes a `Decoded`.
+Pure Rust, through `flacenc`.
+
 **Identified but not decodable:** AC-3, E-AC-3, DTS, DTS-HD MA, Dolby TrueHD,
 WMA, AMR-NB, AMR-WB. None has a published, maintained Rust decoder to point a
 feature at, so these fail with a clear "no decoder" error rather than a misread
@@ -279,6 +292,7 @@ file.
 | `import-he-aac` | HE-AAC v1/v2 via libfdk-aac. Needs a C toolchain; check its licence |
 | `import-opus` | Opus via libopus, built from source. Needs a C compiler |
 | `import-all` | Every format with a working decoder |
+| `export` | FLAC writing, frame by frame. Pure Rust. With `import`, `export::to_flac` |
 
 ## Examples
 
@@ -305,6 +319,23 @@ Developed and run on macOS (CoreAudio) and Windows (WASAPI, ASIO). The
 `OutputType` enum names only those hosts — CoreAudio, WASAPI, ASIO, DirectSound,
 WDMKS, MME — so while cpal itself reaches ALSA and JACK, there is no variant for
 them and Linux is untested.
+
+### Testing on every operating system
+
+```sh
+make docker-test                           # every system this host can run
+make docker-test SYSTEMS="debian alpine"   # just these
+make fixtures                              # the decode fixtures, for a local `make test`
+```
+
+Runs from Linux, Windows (`docker\run.ps1`, or `run.sh` from Git Bash), or an
+Apple-silicon Mac. Debian, Ubuntu, Fedora, and Alpine run the whole suite in
+containers carrying ffmpeg, which makes every decode fixture first so none of
+those tests skips, and a null ALSA device so the device tests run. Windows is
+cross-built and tested under Wine; Android is cross-built with the NDK. The
+native systems are skipped wherever they cannot run rather than failed: macOS
+(and the iOS cross-build) on a Mac, a real Windows container only on a Windows
+host.
 
 ## Contributing
 

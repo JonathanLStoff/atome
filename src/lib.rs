@@ -61,6 +61,8 @@
 use cpal::{Error, ErrorKind};
 
 pub mod device;
+#[cfg(feature = "export")]
+pub mod export;
 pub mod import;
 pub mod input;
 pub mod output;
