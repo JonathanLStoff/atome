@@ -1,6 +1,6 @@
 [package]
 name = "atome" # Must be unique across all of crates.io
-version = "0.8.1"
+version = "0.8.2"
 edition = "2021"
 authors = ["Jonathan Stoff <JonathanLStoff@gmail.com>"]
 
