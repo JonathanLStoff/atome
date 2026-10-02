@@ -5,10 +5,12 @@ use ringbuf::{HeapCons, HeapProd, HeapRb};
 use std::marker::PhantomData;
 
 
+pub mod clock;
 pub mod mixer;
 pub mod types;
 pub mod utils;
 
+pub use clock::PlayClock;
 pub use mixer::{ClearSignal, MixCommand, Mixer, MixerHandle};
 pub use types::{OutputType, SampleRate, SampleType};
 pub use utils::{
@@ -62,6 +64,8 @@ pub struct OutputClass<S: SampleType> {
     consumer: Option<HeapCons<S>>,
     // Keeps the mixer thread running for as long as this output exists
     mixer: MixerHandle,
+    // Where the stream is, as heard: advanced by the callback, read by anyone
+    clock: PlayClock,
     // The sample type lives only in the type system; nothing is stored for it.
     sample_type: PhantomData<S>,
 }
@@ -106,6 +110,7 @@ impl<S: SampleType> OutputClass<S> {
             commands,
             consumer: Some(consumer),
             mixer,
+            clock: PlayClock::new(sample_rate as u32),
             sample_type: PhantomData,
         }
     }
@@ -148,12 +153,20 @@ impl<S: SampleType> OutputClass<S> {
     /// This is also the only place the ring buffer can be emptied — the mixer
     /// holds the producer half and cannot take anything back out — so a
     /// [`stop`](Self::stop) is finished here, not where it is asked for.
+    ///
+    /// Every buffer, silence included, moves the [`PlayClock`] on: the clock
+    /// is the stream's, not a count of what was worth hearing.
     fn data_callback(
         data: &mut [S],
         buffer: &mut HeapCons<S>,
         clear: &ClearSignal,
         cleared: &mut usize,
+        clock: &PlayClock,
+        channels: usize,
+        latency: std::time::Duration,
     ) {
+        clock.advance((data.len() / channels.max(1)) as u64, latency);
+
         let epoch = clear.epoch();
         if epoch != *cleared {
             // A stop is in flight: drop what was already committed and play
@@ -194,16 +207,24 @@ impl<S: SampleType> OutputClass<S> {
         // already past it, sitting in the ring buffer.
         let clear = self.mixer.clear_signal();
         let mut cleared = clear.epoch();
+        let clock = self.clock.clone();
+        let channels = usize::from(self.channels);
 
         let stream = self.device.build_output_stream(
             self.stream_config,
-            move |data: &mut [S], _: &cpal::OutputCallbackInfo| {
-                Self::data_callback(data, &mut buffer, &clear, &mut cleared)
+            move |data: &mut [S], info: &cpal::OutputCallbackInfo| {
+                // How long until what is written now is heard: the device's
+                // buffering and the DAC, as cpal predicts them.
+                let stamp = info.timestamp();
+                let latency = stamp.playback.duration_since(stamp.callback);
+
+                Self::data_callback(data, &mut buffer, &clear, &mut cleared, &clock, channels, latency)
             },
             Self::err_fn,
             None,
         )?;
 
+        self.clock.opened();
         self.stream = Some(stream);
         Ok(self.stream.as_ref().unwrap())
     }
@@ -283,6 +304,19 @@ impl<S: SampleType> OutputClass<S> {
     /// [`build_stream`](Self::build_stream) again.
     pub fn close(&mut self) {
         self.stream.take();
+        self.clock.closed();
+    }
+
+    /// Where this output's stream is, as heard, readable from any thread —
+    /// what a video engine follows so pictures stay on the sound. Cheap to
+    /// clone, and live before the stream is built: it reads zero and stopped
+    /// until the first callback.
+    ///
+    /// Its timeline is the mixer's. A sound scheduled at interleaved index `i`
+    /// with [`add_samples`](Self::add_samples) is heard at
+    /// `i / channels / sample_rate` seconds on this clock.
+    pub fn clock(&self) -> PlayClock {
+        self.clock.clone()
     }
     /// Handle to the mixer thread feeding this output.
     pub fn mixer(&self) -> &MixerHandle {

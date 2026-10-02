@@ -70,7 +70,7 @@ pub mod plugins;
 
 pub use device::{AtomeDevice, Direction};
 pub use input::InputClass;
-pub use output::{OutputClass, SampleRate, SampleType};
+pub use output::{OutputClass, PlayClock, SampleRate, SampleType};
 pub use plugins::Plugin;
 
 /// An input, its stream, and the outputs it feeds.

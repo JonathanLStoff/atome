@@ -13,8 +13,14 @@
 # says which did what. Exits non-zero if any step failed.
 #
 # Always works on a copy of the source — /src in a container, the checkout on a
-# Mac — so the fixtures never reach the working tree. On a Mac the copy shares
-# the checkout's target directory, so nothing is rebuilt that need not be.
+# Mac — so the fixtures never reach the working tree.
+#
+# On a Mac the copy builds into a target directory of its own, kept between
+# runs but never shared with the checkout's: the copy's binaries have the
+# copy's path compiled in (`env!("CARGO_MANIFEST_DIR")`), and cargo, seeing
+# identical sources, would hand them to the next plain `cargo test` in the
+# checkout — tests looking for fixtures in a temp directory long gone. This
+# matrix is for special occasions; it must never change what `make test` does.
 
 set -u
 
@@ -24,7 +30,7 @@ if [ -d /src ]; then
     source=/src
 else
     source="$(cd "$(dirname "$0")/.." && pwd)"
-    export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$source/target}"
+    export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$source/target/docker-macos}"
 fi
 
 work="$(mktemp -d)"
