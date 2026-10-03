@@ -256,8 +256,11 @@ let mut blocks = import::stream::<f32>(path)?; // or a block at a time, as f32
 file's *own* sample type — a 16-bit WAV is `I16`, a 24-bit FLAC is `I24`. Match
 on it to avoid a conversion, or call `to_vec::<S>()` when you need one type.
 
-**Decodes today:** PCM (WAV, AIFF, CAF), MP3, AAC-LC, Vorbis, FLAC, ALAC, plus
-HE-AAC v1/v2 with `import-he-aac` and Opus with `import-opus`. The MP4, Matroska,
+**Decodes today:** PCM (WAV, AIFF, CAF), MP3, Vorbis, FLAC, ALAC, and Opus with
+`import-opus` — plus AAC (LC, HE-AAC v1 and v2) through the **operating
+system's** decoder only: AudioToolbox, Media Foundation, or MediaCodec. AAC is
+patent-pooled, so no AAC decoder is bundled; on Linux, which has no OS decoder
+for it, AAC is refused by name. The MP4, Matroska,
 and Ogg demuxers needed to reach them come with `import`.
 
 ### Writing FLAC (`export` feature)
@@ -288,8 +291,8 @@ file.
 | `au` | Audio Unit v2 hosting. macOS / iOS only |
 | `au3` | Audio Unit v3 (App Extension) hosting. macOS / iOS only |
 | `plugins` | Every plugin format at once |
-| `import` | Audio file decoding — PCM, MP3, AAC-LC, Vorbis, FLAC, ALAC. Pure Rust |
-| `import-he-aac` | HE-AAC v1/v2 via libfdk-aac. Needs a C toolchain; check its licence |
+| `import` | Audio file decoding — PCM, MP3, Vorbis, FLAC, ALAC in pure Rust; AAC through the OS |
+| `import-he-aac` | An alias of `import`, kept so existing builds resolve: HE-AAC is the OS's to decode |
 | `import-opus` | Opus via libopus, built from source. Needs a C compiler |
 | `import-all` | Every format with a working decoder |
 | `export` | FLAC writing, frame by frame. Pure Rust. With `import`, `export::to_flac` |

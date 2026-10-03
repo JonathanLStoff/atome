@@ -45,6 +45,9 @@ use crate::output::SampleType;
 
 pub mod audio;
 
+#[cfg(feature = "import")]
+mod aac;
+
 /// Bytes read from the front of a file to identify it. Every container magic
 /// checked here lives well inside this; MP3 is the one that may need a second
 /// look further in.
@@ -1538,6 +1541,7 @@ fn read_up_to(file: &mut File, buffer: &mut [u8]) -> io::Result<usize> {
 ///
 /// Separate from [`no_decoder`] on purpose: this one the caller can fix, and
 /// the message says how.
+#[cfg_attr(feature = "import", allow(dead_code))]
 fn feature_required(what: &str, feature: &str) -> Error {
     Error::with_message(
         ErrorKind::UnsupportedOperation,

@@ -180,20 +180,20 @@ could be written.
 - [ ] **MP3 (`.mp3`)** — MPEG-1/2/2.5 Layer III; CBR, VBR (Xing/VBRI/LAME
       headers), free-format; ID3v1/v2 skipping; encoder delay + padding
 - [ ] **MP1 / MP2 (`.mp2`)** — still standard in broadcast
-- [ ] **AAC through the OS decoder, never a bundled one** (decided 2026-09-26).
+- [x] **AAC through the OS decoder, never a bundled one** (decided 2026-09-26).
       atome goes into paid software, and a bundled AAC decoder raises the same
       patent question vtome avoids for H.264 by using the OS's — with the OS
       decoder, the licence is the OS vendor's:
-      - [ ] macOS/iOS: AudioToolbox (`AudioConverter`), which also covers
+      - [x] macOS/iOS: AudioToolbox (`AudioConverter`), which also covers
             HE-AAC v1/v2
-      - [ ] Windows: Media Foundation's AAC decoder
-      - [ ] Android: MediaCodec
-      - [ ] Linux: there is no OS AAC decoder to lean on. Decide — a distro's
-            GStreamer, or no AAC on Linux — and write the answer down
-      - [ ] Take `aac` out of Symphonia's features under `import`, so the
+      - [x] Windows: Media Foundation's AAC decoder
+      - [x] Android: MediaCodec
+      - [x] Linux: there is no OS AAC decoder to lean on. Decided (2026-10-03):
+            no AAC on Linux — refused by name, never bundled
+      - [x] Take `aac` out of Symphonia's features under `import`, so the
             bundled decoder is not compiled at all. Symphonia's MP4 and Matroska
             demuxers stay and hand their AAC packets to the OS decoder
-      - [ ] Retire `import-he-aac` (libfdk-aac): the OS decoders cover HE-AAC,
+      - [x] Retire `import-he-aac` (libfdk-aac): the OS decoders cover HE-AAC,
             and the FDK licence grants no patent rights
       - [ ] OrbitX turns on `import-all`, which includes `import-he-aac`, so it
             ships both bundled AAC decoders today
@@ -324,7 +324,7 @@ gets audio out of most video files without one new decoder.
 - [ ] **15. Multi-track and multi-channel output.** MXF and broadcast files carry
       discrete mono tracks that belong together; offer both "extract one track"
       and "extract and combine into one layout"
-- [ ] **AAC in video files goes through the OS decoder** — most audio in video
+- [x] **AAC in video files goes through the OS decoder** — most audio in video
       files is AAC, and `export::to_flac` has to use §3.3's OS path rather
       than Symphonia's bundled decoder
 - [ ] Trim AAC priming in video files: a 3.000 s clip from ffmpeg comes out of
@@ -483,7 +483,7 @@ processor, exported to every format.
 ## 13. Transport, timing, sync
 
 - [ ] Transport: play/stop/record, position in samples/seconds/bars+beats
-- [ ] **The play position of a playing sound, readable from another thread** —
+- [x] **The play position of a playing sound, readable from another thread** —
       what vtome slaves its video clock to (vtome's `MasterClock`), so a video
       added to vtome plays in sync with its audio here. Position as actually
       heard, output latency included, and whether it is running (asked for

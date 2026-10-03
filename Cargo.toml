@@ -56,8 +56,9 @@ flacenc = { version = "0.5", optional = true, default-features = false }
 #
 # `default-features = false` keeps out what no feature asked for — notably the
 # metadata readers and the SIMD paths, which can be turned back on deliberately.
+# AAC is deliberately absent: it is patent-pooled, so it is decoded only by
+# the operating system (see src/import/aac.rs), never by a bundled decoder.
 symphonia = { version = "0.6.0", optional = true, default-features = false, features = [
-    "aac",
     "aiff",
     "alac",
     "caf",
@@ -71,10 +72,6 @@ symphonia = { version = "0.6.0", optional = true, default-features = false, feat
     "wav",
 ] }
 
-# HE-AAC v1 and v2. Symphonia's own AAC decoder is LC only — SBR and PS are not
-# in it — so the high band and parametric stereo need libfdk-aac behind it.
-# C library, and its licence is not one to ship without reading.
-symphonia-adapter-fdk-aac = { version = "0.2.0", optional = true }
 
 # Opus. Chosen over `audiopus` because it implements Symphonia's decoder trait,
 # so it drops into the same pipeline as everything above instead of being a
@@ -92,6 +89,15 @@ symphonia-adapter-libopus = { version = "0.3.0", optional = true }
 [target.'cfg(target_vendor = "apple")'.dependencies]
 truce-rack-au = { version = "1.1.5", optional = true, default-features = false }
 truce-rack-au3 = { version = "1.1.5", optional = true, default-features = false }
+
+# The operating system's AAC decoder on Windows: Media Foundation. Apple's
+# AudioToolbox and Android's MediaCodec are system frameworks declared by hand.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+] }
 
 [features]
 default = []
@@ -138,14 +144,15 @@ plugins = ["vst", "vst3", "au", "au3"]
 # by format: `import` on its own stays pure Rust and needs no toolchain beyond
 # cargo, while each codec that only exists as a C library is its own opt-in.
 
-# PCM (WAV, AIFF, CAF), MP3, AAC-LC, Vorbis, FLAC, ALAC — and the MP4,
-# Matroska, and Ogg demuxing to get at them.
-import = ["dep:symphonia"]
+# PCM (WAV, AIFF, CAF), MP3, Vorbis, FLAC, ALAC — and the MP4, Matroska, and
+# Ogg demuxing to get at them — through Symphonia; AAC (LC, HE-AAC v1 and v2)
+# through the operating system's decoder only. Nothing here bundles an AAC
+# decoder.
+import = ["dep:symphonia", "dep:windows"]
 
-# HE-AAC v1 and v2, via libfdk-aac. Not pure Rust. Without this, an HE-AAC file
-# is still identified correctly and still fails to decode, rather than being
-# quietly decoded as plain LC and sounding wrong.
-import-he-aac = ["import", "dep:symphonia-adapter-fdk-aac"]
+# Kept so existing builds still resolve: HE-AAC is now the operating system's
+# to decode, exactly like LC, and libfdk-aac is gone.
+import-he-aac = ["import"]
 
 # Opus, via libopus. Not pure Rust: builds the C library from source, so it
 # needs a C compiler.

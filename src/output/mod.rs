@@ -3,15 +3,18 @@ use cpal::{Device, Error, ErrorKind, SampleFormat, Stream, StreamConfig};
 use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 use std::marker::PhantomData;
+use std::sync::{Arc, Mutex, PoisonError};
 
 
 pub mod clock;
 pub mod mixer;
+pub mod scheduler;
 pub mod types;
 pub mod utils;
 
 pub use clock::PlayClock;
-pub use mixer::{ClearSignal, MixCommand, Mixer, MixerHandle};
+pub use mixer::{ClearSignal, MixCommand, Mixer, MixerHandle, Voices};
+pub use scheduler::Scheduler;
 pub use types::{OutputType, SampleRate, SampleType};
 pub use utils::{
     default_device, device_name, find_device, get_host_by_id, get_host_by_name, get_host_in_name,
@@ -56,8 +59,9 @@ pub struct OutputClass<S: SampleType> {
     stream: Option<Stream>,
     // Config the stream is (or will be) built with
     stream_config: StreamConfig,
-    // Mixer input queue: `add_samples` writes indexed work here, never audio
-    commands: HeapProd<MixCommand<S>>,
+    // Mixer input queue: `add_samples` writes indexed work here, never audio.
+    // Shared with every `Scheduler`, so other threads can queue work too.
+    commands: Arc<Mutex<HeapProd<MixCommand<S>>>>,
     // Consumer half of the audio ring buffer, sized to exactly one buffer size:
     // taken by `build_stream` and moved into the audio callback. The mixer owns
     // the producer half and keeps it topped up.
@@ -107,7 +111,7 @@ impl<S: SampleType> OutputClass<S> {
             sample_rate,
             stream: None,
             stream_config,
-            commands,
+            commands: Arc::new(Mutex::new(commands)),
             consumer: Some(consumer),
             mixer,
             clock: PlayClock::new(sample_rate as u32),
@@ -246,9 +250,10 @@ impl<S: SampleType> OutputClass<S> {
         let command = MixCommand {
             index,
             samples: samples.to_vec(),
+            voice: None,
         };
 
-        self.commands.try_push(command).map_err(|_| {
+        self.commands.lock().unwrap_or_else(PoisonError::into_inner).try_push(command).map_err(|_| {
             Error::with_message(ErrorKind::ResourceExhausted, "mixer command queue is full")
         })?;
 
@@ -272,9 +277,10 @@ impl<S: SampleType> OutputClass<S> {
         let command = MixCommand {
             index,
             samples: samples.to_vec(),
+            voice: None,
         };
 
-        self.commands.try_push(command).map_err(|_| {
+        self.commands.lock().unwrap_or_else(PoisonError::into_inner).try_push(command).map_err(|_| {
             Error::with_message(ErrorKind::ResourceExhausted, "mixer command queue is full")
         })?;
 
@@ -318,6 +324,19 @@ impl<S: SampleType> OutputClass<S> {
     pub fn clock(&self) -> PlayClock {
         self.clock.clone()
     }
+    /// A handle other threads can schedule this output's audio through —
+    /// cheap to clone, `Send` and `Sync`. What a video engine uses to play a
+    /// film's soundtrack in step with its pictures.
+    pub fn scheduler(&self) -> Scheduler<S> {
+        Scheduler::new(
+            Arc::clone(&self.commands),
+            self.mixer.voices(),
+            self.clock.clone(),
+            self.channels,
+            self.sample_rate as u32,
+        )
+    }
+
     /// Handle to the mixer thread feeding this output.
     pub fn mixer(&self) -> &MixerHandle {
         &self.mixer

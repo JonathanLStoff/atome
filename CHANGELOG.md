@@ -8,6 +8,35 @@ underneath it, so **Done** always holds exactly what is unreleased.
 
 **Done**
 
+- **AAC through the operating system only — no bundled AAC decoder**
+  (decided 2026-09-26, done 2026-10-03, planning §3.3). Symphonia's `aac`
+  feature and `symphonia-adapter-fdk-aac` are gone; `cargo tree -i` finds
+  neither. `import::aac` decodes LC and HE-AAC v1/v2 with AudioToolbox
+  (`AudioConverter`, the cookie's richest format so SBR and PS are decoded),
+  Media Foundation's AAC MFT on Windows, and MediaCodec on Android; Linux
+  refuses AAC by name. Symphonia still demuxes MP4 and Matroska and hands AAC
+  packets to the OS decoder registered in its place; bare ADTS, whose reader
+  came with Symphonia's AAC crate, is split by atome. `aac_in_mp4`,
+  `aac_in_adts`, and the video-soundtrack-to-FLAC test pass through
+  AudioToolbox; Windows and Android are compiled and type-checked, not yet
+  run. `import-he-aac` remains as an alias of `import` so existing builds
+  resolve
+- **`Scheduler`: an output's audio scheduled from any thread**, with voices.
+  `OutputClass::scheduler()` is cheap to clone, `Send` and `Sync`; samples
+  tagged with a voice are held apart until committed, so `cancel(voice)` takes
+  back whatever has not reached the device. What vtome plays a film's
+  soundtrack through
+- Android builds again: the device-id fallback names cpal's AAudio host
+- **`PlayClock`: an output's play position, as heard, from any thread**
+  (planning §13). The cpal callback counts every buffer it hands over —
+  silence included, so it is the stream's own timeline, the mixer's index
+  over channels — and records cpal's callback-to-playback latency.
+  `position()` subtracts the latency, moves smoothly between callbacks but
+  never more than a buffer past the last one, and never runs backwards;
+  `is_running()` goes false on `close` or when callbacks stop. Lock-free on
+  the audio thread. `OutputClass::clock()`; vtome's `Audio::atome` follows it
+- The Docker matrix's Mac leg builds into `target/docker-macos`, so it can no
+  longer leave stale test binaries in the checkout's `target/`
 - **FLAC writing** (`export` feature, pure Rust via `flacenc`). `FlacWriter`
   encodes one block at a time straight to disk and writes the real STREAMINFO
   — sample count, MD5, frame sizes — over a placeholder at `finish`, so a

@@ -90,6 +90,8 @@ impl AtomeDevice {
                 let fallback_host = cpal::platform::HostId::Alsa;
                 #[cfg(target_os = "windows")]
                 let fallback_host = cpal::platform::HostId::Wasapi;
+                #[cfg(target_os = "android")]
+                let fallback_host = cpal::platform::HostId::AAudio;
                 DeviceId::new(fallback_host, name_hash)
             }
         };

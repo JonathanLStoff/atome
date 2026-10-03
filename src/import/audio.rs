@@ -21,11 +21,11 @@
 //! |---|---|---|
 //! | PCM | `symphonia` | `import` |
 //! | MP3 | `symphonia` | `import` |
-//! | AAC-LC | `symphonia` | `import` |
+//! | AAC-LC | the operating system's decoder — never a bundled one | `import` |
 //! | Vorbis | `symphonia` | `import` |
 //! | FLAC | `symphonia` | `import` |
 //! | ALAC | `symphonia` | `import` |
-//! | HE-AAC v1/v2 | `symphonia-adapter-fdk-aac` | `import-he-aac` |
+//! | HE-AAC v1/v2 | the operating system's decoder | `import` |
 //! | Opus | `symphonia-adapter-libopus` | `import-opus` |
 //! | AC-3, E-AC-3 | — | — |
 //! | DTS, DTS-HD MA | — | — |
@@ -68,6 +68,7 @@ use std::path::Path;
 
 use crate::output::SampleType;
 
+#[cfg_attr(feature = "import", allow(unused_imports))]
 use super::{feature_required, no_decoder, AudioStream, Decoded, Encoding};
 
 #[cfg(feature = "import")]
@@ -111,14 +112,9 @@ mod backend {
             let mut registry = CodecRegistry::new();
             symphonia::default::register_enabled_codecs(&mut registry);
 
-            // The adapters register at the same tier as Symphonia's own
-            // decoders and so replace them for the codecs they claim. That is
-            // what is wanted for AAC: libfdk-aac handles LC as well as the SBR
-            // and PS that Symphonia has no decoder for, so one decoder covers
-            // all three profiles rather than two disagreeing about which owns
-            // plain LC.
-            #[cfg(feature = "import-he-aac")]
-            registry.register_audio_decoder::<symphonia_adapter_fdk_aac::AacDecoder>();
+            // AAC, every profile, through the operating system's decoder —
+            // Symphonia's own is not compiled in (see `import::aac`).
+            registry.register_audio_decoder::<super::super::aac::symphonia_decoder::OsAacDecoder>();
 
             #[cfg(feature = "import-opus")]
             registry.register_audio_decoder::<symphonia_adapter_libopus::OpusDecoder>();
@@ -672,6 +668,15 @@ pub(super) fn decode_mp3(path: &Path) -> Result<Decoded, Error> {
     }
 }
 
+/// Whether `path` is bare ADTS rather than AAC inside a container.
+#[cfg(feature = "import")]
+fn is_adts(path: &Path) -> bool {
+    std::fs::File::open(path)
+        .ok()
+        .and_then(|mut file| super::read_container(&mut file, path).ok())
+        == Some(super::Container::Adts)
+}
+
 /// Streams AAC.
 ///
 /// Two decoders behind one function, which is why `encoding` is passed in:
@@ -695,13 +700,15 @@ pub(super) fn read_aac<S: SampleType>(
     path: &Path,
     encoding: Encoding,
 ) -> Result<Box<dyn AudioStream<S>>, Error> {
-    // HE-AAC needs the adapter, whether or not plain `import` is on.
-    if matches!(encoding, Encoding::AacHe | Encoding::AacHeV2) && !cfg!(feature = "import-he-aac") {
-        return Err(feature_required("HE-AAC decoding", "import-he-aac"));
-    }
+    let _ = encoding;
 
     #[cfg(feature = "import")]
     {
+        // Bare ADTS is split here; anything in a container is demuxed by
+        // Symphonia. Either way the decoding is the operating system's.
+        if is_adts(path) {
+            return Ok(Box::new(super::aac::AdtsStream::open(path)?));
+        }
         backend::open(path)
     }
 
@@ -714,14 +721,31 @@ pub(super) fn read_aac<S: SampleType>(
 
 /// Decodes AAC in full. See [`read_aac`] for the work.
 pub(super) fn decode_aac(path: &Path, encoding: Encoding) -> Result<Decoded, Error> {
-    // The same refusal as `read_aac`: an LC-only decoder would take an HE-AAC
-    // file and quietly drop its high band.
-    if matches!(encoding, Encoding::AacHe | Encoding::AacHeV2) && !cfg!(feature = "import-he-aac") {
-        return Err(feature_required("HE-AAC decoding", "import-he-aac"));
-    }
+    let _ = encoding;
 
     #[cfg(feature = "import")]
     {
+        if is_adts(path) {
+            let mut stream = super::aac::AdtsStream::open(path)?;
+            let (sample_rate, channels) = (
+                AudioStream::<f32>::sample_rate(&stream),
+                AudioStream::<f32>::channels(&stream),
+            );
+            let mut samples = Vec::new();
+            let mut block = vec![0.0_f32; 8192 * usize::from(channels.max(1))];
+            loop {
+                let read = AudioStream::<f32>::read(&mut stream, &mut block)?;
+                if read == 0 {
+                    break;
+                }
+                samples.extend_from_slice(&block[..read]);
+            }
+            return Ok(Decoded {
+                samples: super::Samples::F32(samples),
+                sample_rate,
+                channels,
+            });
+        }
         backend::decode(path)
     }
 
