@@ -8,6 +8,19 @@ underneath it, so **Done** always holds exactly what is unreleased.
 
 **Done**
 
+- **FLAC export takes a writer, not only a path.** `FlacWriter` is generic over
+  `W: Write + Seek` (default `File`, so existing code is unchanged);
+  `FlacWriter::new(writer, ..)`, `write_flac_into`, and `to_flac_into` write
+  into a `Cursor`, an open file, or an entry of a `pfac` bundle. `Seek` is
+  required because the header's sample count and MD5 are only known at the end;
+  a sink that cannot seek would get a wrong header, so it is not accepted. The
+  header is patched at the writer's *starting* position, so a writer that
+  already holds bytes keeps them. `FlacWriter::finish_into_inner` hands the
+  writer back, flushed and at the end of the stream. A writer given by the
+  caller is not synced — what flushing it means is its owner's to say — where
+  `create` still syncs its own file. `FlacSummary::bytes` is the stream's size,
+  not the writer's. The path functions and the writer ones produce identical
+  bytes (tested). 6 tests
 - **AAC through the operating system only — no bundled AAC decoder**
   (decided 2026-09-26, done 2026-10-03, planning §3.3). Symphonia's `aac`
   feature and `symphonia-adapter-fdk-aac` are gone; `cargo tree -i` finds

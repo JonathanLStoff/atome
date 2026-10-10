@@ -11,9 +11,10 @@
 
 #![cfg(all(feature = "import", feature = "export"))]
 
+use std::io::{Cursor, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use atome::export::{to_flac, write_flac, FlacWriter};
+use atome::export::{to_flac, to_flac_into, write_flac, write_flac_into, FlacWriter};
 use atome::import::{self, Decoded, Samples};
 use cpal::I24;
 
@@ -152,4 +153,107 @@ fn an_empty_stream_is_still_a_valid_file() {
 
     assert_eq!(summary.frames, 0);
     assert_eq!(std::fs::read(&file.0).unwrap().len(), 42, "header only");
+}
+
+/// The same samples through a path and through a writer must be the same bytes:
+/// a writer is a different destination, not a different encoder.
+#[test]
+fn a_writer_gets_exactly_the_bytes_a_path_would() {
+    let file = Scratch::new("path-twin.flac");
+    let original = sine(10_007, 2, 48_000, 441.0, 32_767.0);
+
+    let mut by_path = FlacWriter::create(&file.0, 48_000, 2, 16).unwrap();
+    by_path.write(&original).unwrap();
+    let path_summary = by_path.finish().unwrap();
+
+    let mut sink = Cursor::new(Vec::new());
+    let mut by_writer = FlacWriter::new(&mut sink, 48_000, 2, 16).unwrap();
+    by_writer.write(&original).unwrap();
+    let writer_summary = by_writer.finish().unwrap();
+
+    assert_eq!(path_summary, writer_summary);
+    assert_eq!(sink.get_ref(), &std::fs::read(&file.0).unwrap());
+    assert_eq!(writer_summary.bytes, sink.get_ref().len() as u64);
+}
+
+#[test]
+fn a_writer_that_already_holds_bytes_has_its_own_header_patched() {
+    // A container around the stream: 100 bytes of something else first. The
+    // header patch must land at the stream's start, not at byte zero.
+    let original = sine(5_000, 1, 44_100, 440.0, 32_767.0);
+
+    let mut sink = Cursor::new(vec![0xAA_u8; 100]);
+    sink.seek(SeekFrom::End(0)).unwrap();
+
+    let mut writer = FlacWriter::new(&mut sink, 44_100, 1, 16).unwrap();
+    writer.write(&original).unwrap();
+    let summary = writer.finish().unwrap();
+
+    let bytes = sink.into_inner();
+    assert_eq!(bytes[..100], [0xAA; 100], "the leading bytes were overwritten");
+    assert_eq!(&bytes[100..104], b"fLaC");
+    assert_eq!(summary.bytes, (bytes.len() - 100) as u64);
+
+    let file = Scratch::new("offset.flac");
+    std::fs::write(&file.0, &bytes[100..]).unwrap();
+    let decoded = import::decode(&file.0).unwrap();
+    assert_eq!(decoded.frames(), 5_000);
+}
+
+#[test]
+fn finishing_hands_the_writer_back_at_the_end_of_the_stream() {
+    let mut writer = FlacWriter::new(Cursor::new(Vec::new()), 44_100, 1, 16).unwrap();
+    writer.write(&[1, 2, 3, 4]).unwrap();
+
+    let (summary, mut sink) = writer.finish_into_inner().unwrap();
+
+    assert_eq!(sink.position(), summary.bytes);
+    // A trailing box written by whoever owns the writer lands after the stream.
+    sink.write_all(b"after").unwrap();
+    assert_eq!(&sink.get_ref()[summary.bytes as usize..], b"after");
+}
+
+#[test]
+fn write_flac_into_matches_write_flac() {
+    let file = Scratch::new("write-flac-twin.flac");
+    let decoded = Decoded {
+        sample_rate: 96_000,
+        channels: 1,
+        samples: Samples::I24(
+            sine(5_003, 1, 96_000, 1_000.0, 8_388_607.0)
+                .into_iter()
+                .map(|sample| I24::new(sample).unwrap())
+                .collect(),
+        ),
+    };
+
+    write_flac(&file.0, &decoded).unwrap();
+
+    let mut sink = Cursor::new(Vec::new());
+    write_flac_into(&mut sink, &decoded).unwrap();
+
+    assert_eq!(sink.into_inner(), std::fs::read(&file.0).unwrap());
+}
+
+#[test]
+fn to_flac_into_matches_to_flac() {
+    let mp3 = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test_data/test415hz.mp3");
+    let file = Scratch::new("to-flac-twin.flac");
+
+    let by_path = to_flac(&mp3, &file.0).unwrap();
+
+    let mut sink = Cursor::new(Vec::new());
+    let by_writer = to_flac_into(&mp3, &mut sink).unwrap();
+
+    assert_eq!(by_path, by_writer);
+    assert_eq!(sink.into_inner(), std::fs::read(&file.0).unwrap());
+}
+
+#[test]
+fn a_refused_stream_is_refused_before_the_writer_is_touched() {
+    let mut sink = Cursor::new(vec![7_u8; 10]);
+
+    assert!(FlacWriter::new(&mut sink, 48_000, 0, 16).is_err());
+    assert!(FlacWriter::new(&mut sink, 48_000, 2, 7).is_err());
+    assert_eq!(sink.into_inner(), vec![7_u8; 10]);
 }

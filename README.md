@@ -276,6 +276,21 @@ let summary = export::to_flac("clip.mp4", "clip.flac")?;
 `FlacWriter` writes one block at a time and `write_flac` writes a `Decoded`.
 Pure Rust, through `flacenc`.
 
+Each has a twin taking a writer instead of a path — `to_flac_into`,
+`write_flac_into`, `FlacWriter::new` — for output that is not a file of its own:
+anything `Write + Seek` (a `Cursor`, a file already open, an entry of a
+[`pfac`](https://crates.io/crates/pfac) bundle). Seek is required because the
+header's sample count and MD5 are only known at the end and are patched in
+afterwards.
+
+```rust
+use std::io::Cursor;
+
+let mut flac = Cursor::new(Vec::new());
+let summary = export::to_flac_into("clip.mp4", &mut flac)?;
+assert_eq!(summary.bytes, flac.get_ref().len() as u64);
+```
+
 **Identified but not decodable:** AC-3, E-AC-3, DTS, DTS-HD MA, Dolby TrueHD,
 WMA, AMR-NB, AMR-WB. None has a published, maintained Rust decoder to point a
 feature at, so these fail with a clear "no decoder" error rather than a misread

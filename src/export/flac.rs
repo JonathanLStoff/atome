@@ -8,6 +8,13 @@
 //! a placeholder header is written first and [`FlacWriter::finish`] overwrites
 //! it in place. The header is a fixed 42 bytes, so nothing after it moves.
 //!
+//! Where the bytes go is the caller's: a path ([`FlacWriter::create`],
+//! [`to_flac`]), or anything that is [`Write`] + [`Seek`] ([`FlacWriter::new`],
+//! [`to_flac_into`]) — a file already open, a [`Cursor`](std::io::Cursor), or a
+//! bundle entry. Seek is what the header patch needs; a sink that cannot seek
+//! cannot be given a correct header, so it is not accepted rather than given a
+//! wrong one.
+//!
 //! `flacenc` takes 8 to 24 bits a sample. Sources wider than that — 32-bit
 //! integer, and float, which is what every lossy decoder hands back — are
 //! written at 24 bits: more resolution than any lossy codec delivered, and
@@ -15,7 +22,7 @@
 
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use cpal::{Error, ErrorKind, I24, U24};
 use flacenc::bitsink::ByteSink;
@@ -44,7 +51,7 @@ pub struct FlacSummary {
     pub channels: u16,
     /// Bits a sample, as written.
     pub bits_per_sample: u8,
-    /// The file's size.
+    /// The FLAC stream's size: from where the writer started to where it ended.
     pub bytes: u64,
 }
 
@@ -73,12 +80,33 @@ impl FlacSummary {
 /// # Ok::<(), cpal::Error>(())
 /// ```
 ///
-/// The file is not a valid FLAC until [`finish`](FlacWriter::finish) has run:
+/// The same, into anything that can seek — an open file, a `Cursor`, an entry
+/// of a bundle:
+///
+/// ```no_run
+/// use std::io::Cursor;
+/// use atome::export::FlacWriter;
+///
+/// let mut bytes = Cursor::new(Vec::new());
+/// let mut writer = FlacWriter::new(&mut bytes, 48_000, 2, 16)?;
+/// writer.write(&[0; 9_600])?;
+/// let summary = writer.finish()?;
+/// assert_eq!(summary.bytes, bytes.get_ref().len() as u64);
+/// # Ok::<(), cpal::Error>(())
+/// ```
+///
+/// The output is not a valid FLAC until [`finish`](FlacWriter::finish) has run:
 /// until then its header is a placeholder. Dropping a writer without finishing
 /// leaves exactly that behind.
-pub struct FlacWriter {
-    path: PathBuf,
-    file: BufWriter<File>,
+pub struct FlacWriter<W: Write + Seek = File> {
+    /// What error messages call the output.
+    label: String,
+    file: BufWriter<W>,
+    /// Where the stream began in `file`, so a writer handed something already
+    /// holding bytes patches its own header rather than the first 42 bytes.
+    start: u64,
+    /// Run once at the end: `sync_all` for a file the writer opened itself.
+    settle: fn(&mut W) -> std::io::Result<()>,
     config: Verified<config::Encoder>,
     stream: Stream,
     buffer: (FrameBuf, Context),
@@ -93,7 +121,7 @@ pub struct FlacWriter {
     frame_sizes: Option<(usize, usize)>,
 }
 
-impl FlacWriter {
+impl FlacWriter<File> {
     /// A FLAC file at `path` for `channels` channels of `bits_per_sample`-bit
     /// audio at `sample_rate`.
     ///
@@ -108,55 +136,78 @@ impl FlacWriter {
         channels: u16,
         bits_per_sample: u8,
     ) -> Result<Self, Error> {
-        let path = path.as_ref().to_path_buf();
+        let path = path.as_ref();
 
-        if !(1..=MAX_CHANNELS).contains(&channels) {
-            return Err(invalid(format!(
-                "FLAC carries 1 to {MAX_CHANNELS} channels, not {channels}"
-            )));
-        }
+        // Checked before the file exists, so a refused writer leaves nothing
+        // behind.
+        let parts = Parts::new(sample_rate, channels, bits_per_sample)?;
 
-        if !(8..=24).contains(&bits_per_sample) {
-            return Err(invalid(format!(
-                "the FLAC encoder writes 8 to 24 bits a sample, not {bits_per_sample}"
-            )));
-        }
+        let label = path.display().to_string();
+        let file = File::create(path).map_err(|error| io_error(&label, "create", error))?;
 
-        let config = config::Encoder::default();
-        let block_size = config.block_size;
-        let config = config
-            .into_verified()
-            .map_err(|(_, error)| encoder_error("the encoder configuration", error))?;
+        FlacWriter::assemble(file, label, |file| file.sync_all(), parts)
+    }
+}
 
-        let stream = Stream::new(
-            sample_rate as usize,
-            usize::from(channels),
-            usize::from(bits_per_sample),
-        )
-        .map_err(|error| invalid(format!("a {sample_rate} Hz FLAC stream: {error}")))?;
+impl<W: Write + Seek> FlacWriter<W> {
+    /// A FLAC stream written to `writer`, from wherever `writer` is now.
+    ///
+    /// Pass `&mut writer` to keep hold of it: `&mut W` is itself `Write + Seek`,
+    /// and the writer is usually something that needs finishing by its owner.
+    /// Nothing is synced — `writer` is not necessarily a file, and what
+    /// flushing it to its destination means is its owner's to say.
+    ///
+    /// # Errors
+    ///
+    /// As [`create`](FlacWriter::create), minus the file, plus whatever seeking
+    /// and writing the header refuse.
+    pub fn new(
+        writer: W,
+        sample_rate: u32,
+        channels: u16,
+        bits_per_sample: u8,
+    ) -> Result<Self, Error> {
+        let parts = Parts::new(sample_rate, channels, bits_per_sample)?;
 
-        let header = header_bytes(&stream)?;
+        FlacWriter::assemble(writer, "the output".to_string(), |_| Ok(()), parts)
+    }
 
-        let file = File::create(&path).map_err(|error| io_error(&path, "create", error))?;
-        let mut file = BufWriter::new(file);
-        file.write_all(&header)
-            .map_err(|error| io_error(&path, "write", error))?;
-
-        let buffer = (
-            FrameBuf::with_size(usize::from(channels), block_size)
-                .map_err(|error| encoder_error("the frame buffer", error))?,
-            Context::new(usize::from(bits_per_sample), usize::from(channels)),
-        );
-
-        Ok(FlacWriter {
-            path,
-            file,
+    fn assemble(
+        mut writer: W,
+        label: String,
+        settle: fn(&mut W) -> std::io::Result<()>,
+        parts: Parts,
+    ) -> Result<Self, Error> {
+        let Parts {
             config,
             stream,
             buffer,
-            pending: Vec::with_capacity(block_size * usize::from(channels)),
+            header,
             block_size,
-            channels: usize::from(channels),
+            channels,
+            sample_rate,
+            bits_per_sample,
+        } = parts;
+
+        let start = writer
+            .stream_position()
+            .map_err(|error| io_error(&label, "find the position in", error))?;
+
+        let mut file = BufWriter::new(writer);
+        file.write_all(&header)
+            .map_err(|error| io_error(&label, "write", error))?;
+
+        Ok(FlacWriter {
+            label,
+            file,
+            start,
+            settle,
+            config,
+            stream,
+            buffer,
+            pending: Vec::with_capacity(block_size * channels),
+            block_size,
+            channels,
             sample_rate,
             bits_per_sample,
             header_len: header.len(),
@@ -200,7 +251,17 @@ impl FlacWriter {
     /// # Errors
     ///
     /// As [`write`](FlacWriter::write).
-    pub fn finish(mut self) -> Result<FlacSummary, Error> {
+    pub fn finish(self) -> Result<FlacSummary, Error> {
+        self.finish_into_inner().map(|(summary, _)| summary)
+    }
+
+    /// [`finish`](FlacWriter::finish), handing back the writer it was given —
+    /// flushed, positioned at the end of the stream.
+    ///
+    /// # Errors
+    ///
+    /// As [`write`](FlacWriter::write).
+    pub fn finish_into_inner(mut self) -> Result<(FlacSummary, W), Error> {
         if !self.pending.is_empty() {
             let rest = std::mem::take(&mut self.pending);
             self.encode(&rest)?;
@@ -233,23 +294,33 @@ impl FlacWriter {
             ));
         }
 
-        let path = self.path.clone();
-        let failed = |error| io_error(&path, "write", error);
+        let label = self.label.clone();
+        let failed = |error| io_error(&label, "write", error);
 
         self.file.flush().map_err(failed)?;
         let file = self.file.get_mut();
-        let bytes = file.stream_position().map_err(failed)?;
-        file.seek(SeekFrom::Start(0)).map_err(failed)?;
+        let end = file.stream_position().map_err(failed)?;
+        file.seek(SeekFrom::Start(self.start)).map_err(failed)?;
         file.write_all(&header).map_err(failed)?;
-        file.sync_all().map_err(failed)?;
+        // Left where a caller who keeps writing — a container around the
+        // stream — would expect to be.
+        file.seek(SeekFrom::Start(end)).map_err(failed)?;
+        (self.settle)(file).map_err(failed)?;
 
-        Ok(FlacSummary {
+        let summary = FlacSummary {
             frames,
             sample_rate: self.sample_rate,
             channels: self.channels as u16,
             bits_per_sample: self.bits_per_sample,
-            bytes,
-        })
+            bytes: end - self.start,
+        };
+
+        let writer = self
+            .file
+            .into_inner()
+            .map_err(|error| io_error(&label, "write", error.into_error()))?;
+
+        Ok((summary, writer))
     }
 
     /// Encodes one block — whole, or the short one at the end — and writes it.
@@ -281,7 +352,7 @@ impl FlacWriter {
 
         self.file
             .write_all(bytes)
-            .map_err(|error| io_error(&self.path, "write", error))?;
+            .map_err(|error| io_error(&self.label, "write", error))?;
 
         self.frame_sizes = Some(match self.frame_sizes {
             None => (bytes.len(), bytes.len()),
@@ -289,6 +360,66 @@ impl FlacWriter {
         });
 
         Ok(())
+    }
+}
+
+/// Everything a writer needs that does not depend on where it writes.
+struct Parts {
+    config: Verified<config::Encoder>,
+    stream: Stream,
+    buffer: (FrameBuf, Context),
+    header: Vec<u8>,
+    block_size: usize,
+    channels: usize,
+    sample_rate: u32,
+    bits_per_sample: u8,
+}
+
+impl Parts {
+    fn new(sample_rate: u32, channels: u16, bits_per_sample: u8) -> Result<Self, Error> {
+        if !(1..=MAX_CHANNELS).contains(&channels) {
+            return Err(invalid(format!(
+                "FLAC carries 1 to {MAX_CHANNELS} channels, not {channels}"
+            )));
+        }
+
+        if !(8..=24).contains(&bits_per_sample) {
+            return Err(invalid(format!(
+                "the FLAC encoder writes 8 to 24 bits a sample, not {bits_per_sample}"
+            )));
+        }
+
+        let config = config::Encoder::default();
+        let block_size = config.block_size;
+        let config = config
+            .into_verified()
+            .map_err(|(_, error)| encoder_error("the encoder configuration", error))?;
+
+        let stream = Stream::new(
+            sample_rate as usize,
+            usize::from(channels),
+            usize::from(bits_per_sample),
+        )
+        .map_err(|error| invalid(format!("a {sample_rate} Hz FLAC stream: {error}")))?;
+
+        let header = header_bytes(&stream)?;
+
+        let buffer = (
+            FrameBuf::with_size(usize::from(channels), block_size)
+                .map_err(|error| encoder_error("the frame buffer", error))?,
+            Context::new(usize::from(bits_per_sample), usize::from(channels)),
+        );
+
+        Ok(Parts {
+            config,
+            stream,
+            buffer,
+            header,
+            block_size,
+            channels: usize::from(channels),
+            sample_rate,
+            bits_per_sample,
+        })
     }
 }
 
@@ -300,7 +431,30 @@ impl FlacWriter {
 /// As [`FlacWriter`].
 pub fn write_flac(path: impl AsRef<Path>, decoded: &Decoded) -> Result<FlacSummary, Error> {
     let bits = bits_for(&decoded.samples);
-    let mut writer = FlacWriter::create(path, decoded.sample_rate, decoded.channels, bits)?;
+    let writer = FlacWriter::create(path, decoded.sample_rate, decoded.channels, bits)?;
+
+    write_decoded(writer, decoded)
+}
+
+/// [`write_flac`], into anything that can seek rather than a path.
+///
+/// # Errors
+///
+/// As [`FlacWriter::new`].
+pub fn write_flac_into(
+    writer: impl Write + Seek,
+    decoded: &Decoded,
+) -> Result<FlacSummary, Error> {
+    let bits = bits_for(&decoded.samples);
+    let writer = FlacWriter::new(writer, decoded.sample_rate, decoded.channels, bits)?;
+
+    write_decoded(writer, decoded)
+}
+
+fn write_decoded<W: Write + Seek>(
+    mut writer: FlacWriter<W>,
+    decoded: &Decoded,
+) -> Result<FlacSummary, Error> {
     let chunk = CHUNK_FRAMES * usize::from(decoded.channels.max(1));
 
     macro_rules! write_as {
@@ -342,11 +496,53 @@ pub fn write_flac(path: impl AsRef<Path>, decoded: &Decoded) -> Result<FlacSumma
 /// Whatever identifying or decoding `input` refuses, and as [`FlacWriter`].
 #[cfg(feature = "import")]
 pub fn to_flac(input: impl AsRef<Path>, output: impl AsRef<Path>) -> Result<FlacSummary, Error> {
+    let output = output.as_ref();
+
+    convert(input.as_ref(), |rate, channels, bits| {
+        FlacWriter::create(output, rate, channels, bits)
+    })
+}
+
+/// [`to_flac`], into anything that can seek rather than a path: an open file, a
+/// `Cursor`, an entry of a bundle.
+///
+/// Pass `&mut writer` to keep hold of the writer — `&mut W` is itself
+/// `Write + Seek`. The stream is written from wherever the writer is, and the
+/// writer is left flushed at the end of it.
+///
+/// ```no_run
+/// use std::io::Cursor;
+///
+/// let mut flac = Cursor::new(Vec::new());
+/// let summary = atome::export::to_flac_into("clip.mp4", &mut flac)?;
+/// assert_eq!(summary.bytes, flac.get_ref().len() as u64);
+/// # Ok::<(), cpal::Error>(())
+/// ```
+///
+/// # Errors
+///
+/// As [`to_flac`], and as [`FlacWriter::new`].
+#[cfg(feature = "import")]
+pub fn to_flac_into(
+    input: impl AsRef<Path>,
+    output: impl Write + Seek,
+) -> Result<FlacSummary, Error> {
+    convert(input.as_ref(), |rate, channels, bits| {
+        FlacWriter::new(output, rate, channels, bits)
+    })
+}
+
+/// Decodes `input` into the writer `open` makes once the stream's rate and
+/// channel count are known.
+#[cfg(feature = "import")]
+fn convert<W: Write + Seek>(
+    input: &Path,
+    open: impl FnOnce(u32, u16, u8) -> Result<FlacWriter<W>, Error>,
+) -> Result<FlacSummary, Error> {
     use cpal::SampleFormat;
 
     use crate::import;
 
-    let input = input.as_ref();
     let encoding = import::find_type(input)?;
 
     // Opened once to learn what the file holds; decoding is lazy, so this
@@ -360,23 +556,23 @@ pub fn to_flac(input: impl AsRef<Path>, output: impl AsRef<Path>) -> Result<Flac
 
     if narrow {
         let stream = import::stream_as::<i16>(input, encoding)?;
-        pump(stream, output.as_ref(), 16, i32::from)
+        pump(stream, open, 16, i32::from)
     } else {
         let stream = import::stream_as::<I24>(input, encoding)?;
-        pump(stream, output.as_ref(), 24, |sample: I24| sample.inner())
+        pump(stream, open, 24, |sample: I24| sample.inner())
     }
 }
 
 /// Reads `stream` to its end into a FLAC file.
 #[cfg(feature = "import")]
-fn pump<S: crate::output::SampleType>(
+fn pump<S: crate::output::SampleType, W: Write + Seek>(
     mut stream: Box<dyn crate::import::AudioStream<S>>,
-    output: &Path,
+    open: impl FnOnce(u32, u16, u8) -> Result<FlacWriter<W>, Error>,
     bits: u8,
     convert: impl Fn(S) -> i32,
 ) -> Result<FlacSummary, Error> {
     let channels = stream.channels();
-    let mut writer = FlacWriter::create(output, stream.sample_rate(), channels, bits)?;
+    let mut writer = open(stream.sample_rate(), channels, bits)?;
 
     let mut block = vec![S::SILENCE; CHUNK_FRAMES * usize::from(channels.max(1))];
     let mut samples = Vec::with_capacity(block.len());
@@ -431,13 +627,13 @@ fn encoder_error(what: &str, error: impl std::fmt::Display) -> Error {
     Error::with_message(ErrorKind::Other, format!("FLAC encoder, {what}: {error}"))
 }
 
-fn io_error(path: &Path, doing: &str, error: std::io::Error) -> Error {
+fn io_error(what: &str, doing: &str, error: std::io::Error) -> Error {
     let kind = match error.kind() {
         std::io::ErrorKind::PermissionDenied => ErrorKind::PermissionDenied,
         _ => ErrorKind::Other,
     };
 
-    Error::with_message(kind, format!("could not {doing} {}: {error}", path.display()))
+    Error::with_message(kind, format!("could not {doing} {what}: {error}"))
 }
 
 #[cfg(test)]
