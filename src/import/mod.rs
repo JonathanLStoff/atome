@@ -427,6 +427,26 @@ pub fn stream<S: SampleType>(path: &Path) -> Result<Box<dyn AudioStream<S>>, Err
     stream_as(path, encoding)
 }
 
+/// What [`stream_reader`] reads from: any seekable byte source that can move
+/// to another thread — a file, a `Cursor`, an entry of a pfac bundle.
+pub trait ReadSeek: std::io::Read + std::io::Seek + Send + Sync {}
+
+impl<T: std::io::Read + std::io::Seek + Send + Sync> ReadSeek for T {}
+
+/// Opens audio read from `reader` for reading a block at a time: [`stream`]
+/// for audio that is not a file of its own. The container is found from the
+/// bytes, as [`stream`] does; `name` is only what errors call it.
+///
+/// Every container and codec Symphonia decodes here (with the `import`
+/// feature): FLAC, WAV, MP3, AAC through the OS decoder, and the rest
+/// [`stream`] reads through Symphonia.
+pub fn stream_reader<S: SampleType>(
+    reader: Box<dyn ReadSeek>,
+    name: &str,
+) -> Result<Box<dyn AudioStream<S>>, Error> {
+    audio::read_reader(reader, name)
+}
+
 /// Opens `path` as `encoding` for streaming, skipping identification.
 pub fn stream_as<S: SampleType>(
     path: &Path,

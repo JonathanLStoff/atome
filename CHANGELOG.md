@@ -8,6 +8,12 @@ underneath it, so **Done** always holds exactly what is unreleased.
 
 **Done**
 
+- **Streaming from a reader (0.8.5).** `import::stream_reader::<S>(reader,
+  name)` streams audio from any `Box<dyn ReadSeek>` (`Read + Seek + Send +
+  Sync`: a `Cursor`, an entry of a pfac bundle) through the same Symphonia
+  backend `stream` uses, the container found from the bytes; `name` is only
+  what errors say. `open_parts` now opens the file and hands it to
+  `open_source`, which the reader path shares. Needs `import`
 - **FLAC export takes a writer, not only a path.** `FlacWriter` is generic over
   `W: Write + Seek` (default `File`, so existing code is unchanged);
   `FlacWriter::new(writer, ..)`, `write_flac_into`, and `to_flac_into` write

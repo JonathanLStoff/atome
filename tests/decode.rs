@@ -293,3 +293,31 @@ fn formats_without_a_decoder_fail_clearly() {
         assert!(!message.contains("feature"), "{encoding:?}: {message}");
     }
 }
+
+/// Audio read from a reader (here an in-memory copy of the file) streams the
+/// same samples as the file itself.
+#[test]
+fn a_reader_streams_what_the_file_does() {
+    let path = test_data("test415hz.mp3");
+    assert!(path.exists(), "tests/test_data/test415hz.mp3 is missing");
+
+    let read_all = |stream: &mut dyn import::AudioStream<f32>| {
+        let mut block = vec![0f32; 4096];
+        let mut samples = Vec::new();
+        loop {
+            let read = stream.read(&mut block).expect("stream read");
+            if read == 0 {
+                break samples;
+            }
+            samples.extend_from_slice(&block[..read]);
+        }
+    };
+
+    let mut from_file = import::stream::<f32>(&path).expect("stream");
+    let bytes = std::fs::read(&path).expect("read the fixture");
+    let mut from_reader = import::stream_reader::<f32>(Box::new(std::io::Cursor::new(bytes)), "test415hz.mp3").expect("stream_reader");
+
+    assert_eq!(from_reader.sample_rate(), from_file.sample_rate());
+    assert_eq!(from_reader.channels(), from_file.channels());
+    assert_eq!(read_all(from_reader.as_mut()), read_all(from_file.as_mut()));
+}

@@ -92,7 +92,7 @@ mod backend {
     use symphonia::core::errors::Error as SymphoniaError;
     use symphonia::core::formats::probe::Hint;
     use symphonia::core::formats::{FormatOptions, FormatReader, TrackType};
-    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::io::{MediaSource, MediaSourceStream};
     use symphonia::core::meta::MetadataOptions;
 
     use crate::output::SampleType;
@@ -126,6 +126,42 @@ mod backend {
     /// Opens `path` for streamed decoding, converting into `S` as it goes.
     pub(super) fn open<S: SampleType>(path: &Path) -> Result<Box<dyn AudioStream<S>>, Error> {
         Ok(Box::new(SymphoniaStream::open(path)?))
+    }
+
+    /// Opens audio read from `reader` for streamed decoding. `name` is what
+    /// errors call it.
+    pub(super) fn open_reader<S: SampleType>(
+        reader: Box<dyn super::super::ReadSeek>,
+        name: &str,
+    ) -> Result<Box<dyn AudioStream<S>>, Error> {
+        let source = Box::new(Seekable(reader));
+        Ok(Box::new(SymphoniaStream::from_parts(open_source(source, Path::new(name))?)))
+    }
+
+    /// Any `Read + Seek` as Symphonia's media source. Its length is not asked
+    /// for: the probe and the decoders only need to read and seek.
+    struct Seekable(Box<dyn super::super::ReadSeek>);
+
+    impl std::io::Read for Seekable {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.0.read(buffer)
+        }
+    }
+
+    impl std::io::Seek for Seekable {
+        fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.0.seek(position)
+        }
+    }
+
+    impl MediaSource for Seekable {
+        fn is_seekable(&self) -> bool {
+            true
+        }
+
+        fn byte_len(&self) -> Option<u64> {
+            None
+        }
     }
 
     /// A decoder and the demuxer feeding it, plus whatever the last decoded
@@ -192,7 +228,13 @@ mod backend {
             Error::with_message(kind, format!("could not read {}: {error}", path.display()))
         })?;
 
-        let source = MediaSourceStream::new(Box::new(file), Default::default());
+        open_source(Box::new(file), path)
+    }
+
+    /// [`open_parts`] on a source already open: a file, or any reader.
+    /// `path` is only what errors call it.
+    fn open_source(source: Box<dyn MediaSource>, path: &Path) -> Result<Opened, Error> {
+        let source = MediaSourceStream::new(source, Default::default());
 
         // No `Hint`: the extension is exactly the thing this crate refuses to
         // trust, and the probe finds the container from its bytes.
@@ -435,6 +477,10 @@ mod backend {
 
     impl<S: SampleType> SymphoniaStream<S> {
         fn open(path: &Path) -> Result<Self, Error> {
+            Ok(Self::from_parts(open_parts(path)?))
+        }
+
+        fn from_parts(opened: Opened) -> Self {
             let Opened {
                 format,
                 decoder,
@@ -443,9 +489,9 @@ mod backend {
                 channels,
                 total_frames,
                 bits,
-            } = open_parts(path)?;
+            } = opened;
 
-            Ok(SymphoniaStream {
+            SymphoniaStream {
                 format,
                 decoder,
                 track_id,
@@ -458,7 +504,7 @@ mod backend {
                 taken: 0,
                 emitted: 0,
                 limit: total_frames.map(|frames| frames.saturating_mul(channels.max(1) as u64)),
-            })
+            }
         }
 
         /// Decodes packets until one yields audio, leaving it in `pending`.
@@ -852,6 +898,24 @@ pub(super) fn decode_wma(path: &Path) -> Result<Decoded, Error> {
 /// `STREAMINFO` carries an exact frame count, so this is one of the few formats
 /// where [`total_frames`](AudioStream::total_frames) is exact rather than
 /// absent or a guess.
+/// Streams audio from a reader through Symphonia, whatever its container.
+/// See [`super::stream_reader`].
+pub(super) fn read_reader<S: SampleType>(
+    reader: Box<dyn super::ReadSeek>,
+    name: &str,
+) -> Result<Box<dyn AudioStream<S>>, Error> {
+    #[cfg(feature = "import")]
+    {
+        backend::open_reader(reader, name)
+    }
+
+    #[cfg(not(feature = "import"))]
+    {
+        let _ = (reader, name);
+        Err(feature_required("decoding from a reader", "import"))
+    }
+}
+
 pub(super) fn read_flac<S: SampleType>(path: &Path) -> Result<Box<dyn AudioStream<S>>, Error> {
     #[cfg(feature = "import")]
     {
