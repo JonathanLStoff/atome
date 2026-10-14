@@ -252,10 +252,20 @@ impl<S: SampleType> Mixer<S> {
     /// where later commands can still be summed into it. That one buffer size is
     /// therefore the scheduling horizon: a command landing inside the buffer
     /// already handed over is late, and its overlapping part is dropped.
+    ///
+    /// When there is less in `mix` than room in `output`, the gap goes out as
+    /// silence, so the ring is always full and the cursor stays exactly one
+    /// buffer ahead of the [`PlayClock`](super::PlayClock). Leaving it to idle
+    /// would freeze the cursor while the clock kept counting, and a sound
+    /// scheduled off the clock would land however long the output had been
+    /// quiet in the future — late, or past [`MAX_SCHEDULE_AHEAD`] and dropped.
     fn flush(&mut self) -> usize {
-        let ready = self.mix.len().min(self.output.vacant_len());
+        let ready = self.output.vacant_len();
         if ready == 0 {
             return 0;
+        }
+        if self.mix.len() < ready {
+            self.mix.resize(ready, S::SILENCE);
         }
 
         self.commit_voices(ready);
@@ -432,5 +442,33 @@ mod tests {
         let mut second = [0.0; 4];
         device.pop_slice(&mut second);
         assert_eq!(second, [0.25; 4], "the voice is gone, the rest is not");
+    }
+
+    /// With nothing to play the cursor still keeps pace with the device, so a
+    /// sound scheduled just ahead of it after a long quiet stretch is neither
+    /// late nor dropped.
+    #[test]
+    fn an_idle_mixer_keeps_pace_with_the_device() {
+        let (mut commands, mut mixer, mut device) = mixer(4);
+
+        // Far longer than MAX_SCHEDULE_AHEAD of silence.
+        let quiet = MAX_SCHEDULE_AHEAD * 2;
+        let mut heard = [1.0; 4];
+        for _ in 0..quiet / 4 {
+            mixer.tick();
+            assert_eq!(device.pop_slice(&mut heard), 4, "the ring never runs dry");
+            assert_eq!(heard, [0.0; 4]);
+        }
+        mixer.tick();
+        assert_eq!(mixer.cursor(), quiet + 4, "one buffer ahead of what was played");
+
+        let _ = commands.try_push(command(quiet + 4, vec![0.5; 4], None));
+        mixer.tick();
+        device.pop_slice(&mut heard);
+        assert_eq!(heard, [0.0; 4], "the buffer already committed");
+        mixer.tick();
+        device.pop_slice(&mut heard);
+        assert_eq!(heard, [0.5; 4]);
+        assert_eq!((mixer.late_samples(), mixer.dropped_samples()), (0, 0));
     }
 }

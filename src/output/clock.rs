@@ -125,9 +125,10 @@ impl PlayClock {
         Duration::from_nanos(furthest)
     }
 
-    /// Frames handed to the device since the stream was built — silence
-    /// included, so this is the stream's own timeline, the mixer's index
-    /// divided by the channel count.
+    /// Frames taken from the mixer since the stream was built — its padding
+    /// silence included, so this is the stream's own timeline, the mixer's
+    /// index divided by the channel count. The mixer's cursor runs one buffer
+    /// ahead of it, so scheduling at `frames() + buffer` is never late.
     pub fn frames(&self) -> u64 {
         let state = &*self.state;
         state.frames_before.load(Ordering::Relaxed) + state.period.load(Ordering::Relaxed)

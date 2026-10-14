@@ -8,6 +8,17 @@ underneath it, so **Done** always holds exactly what is unreleased.
 
 **Done**
 
+- **Sounds scheduled after a quiet stretch play on time.** The mixer used to
+  stop moving its cursor whenever it had nothing to play, while the
+  `PlayClock` kept counting. Anything scheduled off the clock after more than
+  about 11 s of quiet (`MAX_SCHEDULE_AHEAD`, stereo 48 kHz) was silently
+  dropped, and anything sooner started late by however long the output had
+  been idle. This silenced OrbitX cues and could affect vtome soundtracks.
+  `Mixer::flush` now pads with silence so the ring is always full and the
+  cursor stays exactly one buffer ahead of the clock. The clock now advances
+  by what the callback takes out of the ring (played, or dropped by a stop)
+  instead of by the device's buffer length, so a stop or an underrun no longer
+  makes the two drift apart. 1 test
 - **Streaming from a reader (0.8.5).** `import::stream_reader::<S>(reader,
   name)` streams audio from any `Box<dyn ReadSeek>` (`Read + Seek + Send +
   Sync`: a `Cursor`, an entry of a pfac bundle) through the same Symphonia

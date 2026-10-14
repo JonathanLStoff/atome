@@ -158,8 +158,12 @@ impl<S: SampleType> OutputClass<S> {
     /// holds the producer half and cannot take anything back out — so a
     /// [`stop`](Self::stop) is finished here, not where it is asked for.
     ///
-    /// Every buffer, silence included, moves the [`PlayClock`] on: the clock
-    /// is the stream's, not a count of what was worth hearing.
+    /// The [`PlayClock`] moves on by what this takes out of the ring — played
+    /// or thrown away by a stop — so it reads the mixer's index exactly. The
+    /// mixer pads quiet stretches with silence, so that is every frame the
+    /// device plays; only the padding for an underrun or a stop, which stands
+    /// in for no index at all, is left off. Counting those would push the
+    /// clock ahead of the mixer and make every later sound land that much late.
     fn data_callback(
         data: &mut [S],
         buffer: &mut HeapCons<S>,
@@ -169,7 +173,7 @@ impl<S: SampleType> OutputClass<S> {
         channels: usize,
         latency: std::time::Duration,
     ) {
-        clock.advance((data.len() / channels.max(1)) as u64, latency);
+        let channels = channels.max(1);
 
         let epoch = clear.epoch();
         if epoch != *cleared {
@@ -177,11 +181,12 @@ impl<S: SampleType> OutputClass<S> {
             // silence instead of it. This keeps happening until the mixer has
             // answered the same stop, because until then it may still be
             // flushing pre-stop samples into the ring behind us.
-            buffer.clear();
+            let dropped = buffer.clear();
             data.fill(S::SILENCE);
             if clear.acked() == epoch {
                 *cleared = epoch;
             }
+            clock.advance((dropped / channels) as u64, latency);
             return;
         }
 
@@ -190,6 +195,7 @@ impl<S: SampleType> OutputClass<S> {
             // Underrun: pad with silence rather than replaying stale audio.
             data[read..].fill(S::SILENCE);
         }
+        clock.advance((read / channels) as u64, latency);
     }
 
     /// Builds the cpal output stream for this output's device, pulling mixed
