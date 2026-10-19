@@ -74,6 +74,26 @@ pub struct OutputClass<S: SampleType> {
     sample_type: PhantomData<S>,
 }
 
+/// The rates to try for an output whose device will not take the one it was asked for: only rates
+/// above it, nearest first.
+///
+/// Never downward. Resampling up keeps the whole band, while dropping to a lower rate throws the
+/// top of it away — and a caller that asked for 44.1 kHz asked for it, so landing on 16 kHz would
+/// be a quieter failure than refusing. Where nothing above will open, the caller keeps the rate it
+/// asked for and reports the device's own refusal.
+///
+/// `native` is left out: the caller tries the rate the device is already running at first, that
+/// being the one most likely to work.
+fn fallback_rates(wanted: SampleRate, native: Option<SampleRate>) -> Vec<SampleRate> {
+    let mut higher: Vec<SampleRate> = SampleRate::ALL
+        .into_iter()
+        .filter(|rate| rate.hz() > wanted.hz() && Some(*rate) != native)
+        .collect();
+
+    higher.sort_by_key(|rate| rate.hz() - wanted.hz());
+    higher
+}
+
 impl<S: SampleType> OutputClass<S> {
     pub fn new(device: Option<Device>, out_type: OutputType, channels: u16, sample_rate:SampleRate, buffer_size: Option<i32>) -> Self {
         // `None` lets the device pick its own buffer size. We can't know that
@@ -198,14 +218,86 @@ impl<S: SampleType> OutputClass<S> {
         clock.advance((read / channels) as u64, latency);
     }
 
+    /// Whether this output's device will open at `rate`, found out by opening it.
+    ///
+    /// Asking the host instead does not work on Windows: `supported_output_configs` lists what
+    /// the device could manage in exclusive mode, while a shared-mode stream only ever gets the
+    /// rate the device is already mixing at. The stream built here is never played and is closed
+    /// again before this returns.
+    fn opens_at(&self, rate: SampleRate) -> bool {
+        let config = StreamConfig {
+            sample_rate: rate.hz(),
+            ..self.stream_config
+        };
+
+        self.device
+            .build_output_stream(
+                config,
+                move |_data: &mut [S], _info: &cpal::OutputCallbackInfo| {},
+                |_error| {},
+                None,
+            )
+            .is_ok()
+    }
+
+    /// The rate to open this output at: its own where the device will take it, the rate the
+    /// device is already running at otherwise, and failing that the nearest rate it will take.
+    ///
+    /// Nothing is given up by moving: an output resamples whatever is scheduled on it to its own
+    /// rate already (see [`align_samples`](Self::align_samples)), so the rate here is the one
+    /// content lands on rather than a rate content has to be in. A device that will not run at
+    /// the engine's rate plays at its own instead of staying silent.
+    fn usable_rate(&self) -> SampleRate {
+        // What the device is mixing at. Asked for that rate it cannot refuse, so the usual case —
+        // an engine at the rate its devices run at — settles here without opening anything.
+        let mixing_at = self.device.default_output_config().ok().map(|config| config.sample_rate());
+        if mixing_at == Some(self.sample_rate.hz()) || self.opens_at(self.sample_rate) {
+            return self.sample_rate;
+        }
+
+        let native = mixing_at
+            .and_then(SampleRate::from_hz)
+            .filter(|rate| *rate != self.sample_rate);
+        if let Some(native) = native.filter(|rate| self.opens_at(*rate)) {
+            return native;
+        }
+
+        // Then whatever else it will take — a device at a rate this enum does not name lands here.
+        // Nothing at all opens: keep the rate asked for, so `build_stream` reports the device's
+        // own refusal rather than one for a rate nobody chose.
+        fallback_rates(self.sample_rate, native)
+            .into_iter()
+            .find(|rate| self.opens_at(*rate))
+            .unwrap_or(self.sample_rate)
+    }
+
+    /// Moves this output to `rate`: the stream it will build, the rate content is aligned to, and
+    /// the clock. Only before the stream is built.
+    fn retune(&mut self, rate: SampleRate) {
+        self.sample_rate = rate;
+        self.stream_config.sample_rate = rate.hz();
+        self.clock.retune(rate.hz());
+    }
+
     /// Builds the cpal output stream for this output's device, pulling mixed
     /// samples out of its ring buffer and writing them as `S`. The resulting
     /// `Stream` is stored on `self` (streams must be kept alive to keep playing)
     /// and also returned.
     ///
+    /// Opens at the rate this output was made with where the device will take it, and at a rate
+    /// the device will take otherwise — [`sample_rate`](Self::sample_rate) then reports the rate
+    /// it actually runs at, which is also the rate content is resampled to.
+    ///
     /// Consumes the consumer half of the ring buffer, so it can only be called
     /// once per `OutputClass`.
     pub fn build_stream(&mut self) -> Result<&Stream, Error> {
+        // Before the ring buffer is consumed: a failed build takes the consumer half with it, so
+        // the rate has to be settled while there is still something to retry with.
+        let usable = self.usable_rate();
+        if usable != self.sample_rate {
+            self.retune(usable);
+        }
+
         let mut buffer = self.consumer.take().ok_or_else(|| {
             Error::with_message(
                 ErrorKind::UnsupportedOperation,
@@ -492,4 +584,67 @@ impl<S: SampleType> OutputClass<S> {
         eprintln!("audio output stream error: {}", err);
     }
 
+}
+
+#[cfg(test)]
+mod rate_tests {
+    use super::*;
+
+    /// Falling back climbs and never drops: a caller that asked for 44.1 kHz would rather be
+    /// refused than quietly handed 16 kHz.
+    #[test]
+    fn a_fallback_only_reaches_for_higher_rates() {
+        let order = fallback_rates(SampleRate::Hz44_1k, None);
+
+        assert_eq!(order[0], SampleRate::Hz48k, "the next rate up, first");
+        assert_eq!(order[1], SampleRate::Hz88_2k);
+        assert!(order.iter().all(|rate| rate.hz() > SampleRate::Hz44_1k.hz()), "{order:?}");
+        assert!(!order.contains(&SampleRate::Hz44_1k), "the rate that failed is not retried");
+    }
+
+    /// The rate the device is already running at is the caller's first move, so it is not repeated.
+    #[test]
+    fn a_fallback_leaves_out_the_rate_already_tried() {
+        let order = fallback_rates(SampleRate::Hz44_1k, Some(SampleRate::Hz48k));
+
+        assert!(!order.contains(&SampleRate::Hz48k));
+        assert_eq!(order[0], SampleRate::Hz88_2k, "the next one up after it");
+    }
+
+    /// Nothing is above the top rate, so there is nowhere to climb to.
+    #[test]
+    fn the_top_rate_has_nowhere_to_fall_back_to() {
+        assert!(fallback_rates(SampleRate::Hz352_8, None).is_empty());
+    }
+
+    /// An output ends up at a rate its device will take, whatever was asked for, and says which.
+    ///
+    /// Every rate opens on a machine whose host converts for us (Windows's shared-mode engine
+    /// does, since cpal 0.18.2), so on those this asserts that nothing was moved needlessly. On a
+    /// host that refuses, it asserts the fallback landed somewhere the device accepts. A machine
+    /// with no output device tests nothing and still passes.
+    #[test]
+    fn an_output_opens_at_a_rate_its_device_will_take() {
+        let Some(device) = default_device() else { return };
+        let channels = device.default_output_config().map(|config| config.channels()).unwrap_or(2);
+
+        for asked in [SampleRate::Hz44_1k, SampleRate::Hz48k, SampleRate::Hz88_2k] {
+            let mut output =
+                OutputClass::<f32>::new(Some(device.clone()), OutputType::WASAPI, channels, asked, Some(512));
+
+            // Whatever `build_stream` reports, the rate it settled on is the one it opened with.
+            let built = output.build_stream().is_ok();
+            let got = output.sample_rate() as u32;
+
+            if built {
+                assert!(
+                    SampleRate::from_hz(got).is_some(),
+                    "opened at {got} Hz, which is not one of atome's rates"
+                );
+            } else {
+                // Nothing opened at all: the rate asked for is kept, so the error is about that.
+                assert_eq!(got, asked.hz(), "a refused output should keep the rate it was asked for");
+            }
+        }
+    }
 }

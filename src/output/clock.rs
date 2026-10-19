@@ -172,6 +172,14 @@ impl PlayClock {
         Duration::from_nanos(since) <= allowance
     }
 
+    /// The stream will run at `sample_rate` after all, not the rate this clock was made with.
+    ///
+    /// Only before it opens. Every position is worked out from this rate, so changing it under a
+    /// running stream would move the whole timeline at once.
+    pub(crate) fn retune(&self, sample_rate: u32) {
+        self.state.sample_rate.store(sample_rate.max(1), Ordering::Relaxed);
+    }
+
     /// The stream is about to start calling.
     pub(crate) fn opened(&self) {
         self.state.open.store(true, Ordering::Release);

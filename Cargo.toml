@@ -1,6 +1,6 @@
 [package]
 name = "atome" # Must be unique across all of crates.io
-version = "0.8.6"
+version = "0.8.7"
 edition = "2021"
 authors = ["Jonathan Stoff <JonathanLStoff@gmail.com>"]
 
@@ -20,7 +20,7 @@ categories = ["multimedia::audio", "multimedia::encoding"]
 
 [dependencies]
 atomic-queue = "2.2.0"
-cpal = "0.18.1"
+cpal = "0.18.2"
 ringbuf = "0.5.1"
 
 
