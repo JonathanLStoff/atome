@@ -454,6 +454,9 @@ mod platform {
         mft: IMFTransform,
         rate: u32,
         channels: u16,
+        /// The rate the stream's own AudioSpecificConfig states. Asked for at every
+        /// renegotiation, so the decode keeps the source's rate where Windows will give it.
+        wanted: u32,
     }
 
     // SAFETY: the AAC decoder MFT is free-threaded; `&mut self` keeps it to
@@ -532,7 +535,7 @@ mod platform {
             mft.SetInputType(0, &kind, 0).map_err(|e| failed("the input type", e))?;
         }
 
-        let (rate, channels) = float_output(&mft)?;
+        let (rate, channels) = float_output(&mft, config.sample_rate)?;
 
         // SAFETY: a live MFT with both types set.
         unsafe {
@@ -540,32 +543,75 @@ mod platform {
             let _ = mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
         }
 
-        Ok(Box::new(Mft { mft, rate, channels }))
+        Ok(Box::new(Mft { mft, rate, channels, wanted: config.sample_rate }))
     }
 
-    /// Sets the first float output type on offer, and says what it is.
-    fn float_output(mft: &IMFTransform) -> Result<(u32, u16), String> {
-        for index in 0.. {
-            // SAFETY: a live MFT; the end of the list is an error, which ends
-            // the search.
-            let offered = unsafe { mft.GetOutputAvailableType(0, index) }.map_err(|e| failed("a float output", e))?;
-            // SAFETY: a live media type.
-            let subtype: GUID = unsafe { offered.GetGUID(&MF_MT_SUBTYPE) }.unwrap_or_default();
-            if subtype == MFAudioFormat_Float {
-                // SAFETY: as above.
-                unsafe {
-                    mft.SetOutputType(0, &offered, 0).map_err(|e| failed("the output type", e))?;
-                    let rate = offered.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND).unwrap_or(48_000);
-                    let channels = offered.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS).unwrap_or(2);
-                    return Ok((rate, channels as u16));
+    /// Sets a float output type and says what it is, asking for `wanted` where it is on offer.
+    ///
+    /// Windows decides what an AAC stream decodes to and does not always offer the rate the
+    /// stream states: a 22 050 Hz mono file is commonly offered only as 44 100 Hz stereo. Where
+    /// the stream's own rate *is* offered it is taken, so an import keeps what the source held;
+    /// where it is not, whatever Windows will give is taken instead — which is also right for
+    /// HE-AAC, whose real output rate is twice the stated one.
+    ///
+    /// Two passes rather than one: the type is fetched again by index before being set, so no
+    /// media type is held across further calls into the MFT.
+    fn float_output(mft: &IMFTransform, wanted: u32) -> Result<(u32, u16), String> {
+        let describe = |index: u32| -> Option<(u32, u16)> {
+            // SAFETY: a live MFT; running off the end of the list is an error, not a crash.
+            let offered = unsafe { mft.GetOutputAvailableType(0, index) }.ok()?;
+            // SAFETY: a live media type; a missing attribute is an error, not a crash.
+            unsafe {
+                if offered.GetGUID(&MF_MT_SUBTYPE).unwrap_or_default() != MFAudioFormat_Float {
+                    return None;
                 }
+                Some((
+                    offered.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND).unwrap_or(48_000),
+                    offered.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS).unwrap_or(2) as u16,
+                ))
+            }
+        };
+
+        let mut first: Option<u32> = None;
+        let mut matching: Option<u32> = None;
+
+
+        for index in 0..64 {
+            // SAFETY: as in `describe`.
+            if unsafe { mft.GetOutputAvailableType(0, index) }.is_err() {
+                break;
+            }
+            let Some((rate, _)) = describe(index) else { continue };
+            first.get_or_insert(index);
+            if rate == wanted {
+                matching = Some(index);
+                break;
             }
         }
-        Err("no float output".to_string())
+
+        let index = matching.or(first).ok_or_else(|| "no float output".to_string())?;
+        // SAFETY: a live MFT and an index it just offered.
+        let offered = unsafe { mft.GetOutputAvailableType(0, index) }.map_err(|e| failed("a float output", e))?;
+        // SAFETY: a live MFT and a type it offered.
+        unsafe { mft.SetOutputType(0, &offered, 0) }.map_err(|e| failed("the output type", e))?;
+
+        // Read back from the MFT rather than from the list: setting a type can reorder what is on
+        // offer, so the index that was chosen no longer names the same thing. The current type is
+        // the only authority on what is actually coming out — and getting this wrong labelled a
+        // 22 050 Hz mono decode as 44 100 Hz stereo, which plays at four times the speed.
+        // SAFETY: a live MFT whose output type has just been set.
+        let current = unsafe { mft.GetOutputCurrentType(0) }.map_err(|e| failed("the output type", e))?;
+        // SAFETY: a live media type; a missing attribute is an error, not a crash.
+        unsafe {
+            Ok((
+                current.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND).map_err(|e| failed("the output rate", e))?,
+                current.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS).map_err(|e| failed("the output channels", e))? as u16,
+            ))
+        }
     }
 
     impl Mft {
-        fn pull(&self, out: &mut Vec<f32>) -> Result<bool, String> {
+        fn pull(&mut self, out: &mut Vec<f32>) -> Result<bool, String> {
             // SAFETY: plain allocations, owned here; one output buffer for the
             // MFT's one stream.
             unsafe {
@@ -600,6 +646,16 @@ mod platform {
                         Ok(true)
                     }
                     Err(error) if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(false),
+                    // Windows works the real output format out from the first frames and asks for
+                    // the output type to be set again. Answering it is what the decode needs —
+                    // left as an error, the MFT took no further input and the file decoded to
+                    // nothing — and it is the moment the stream's own rate becomes available to
+                    // ask for, so `wanted` is offered up again here.
+                    Err(error) if error.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                        let (rate, channels) = float_output(&self.mft, self.wanted)?;
+                        (self.rate, self.channels) = (rate, channels);
+                        Ok(true)
+                    }
                     Err(error) => Err(failed("decoding", error)),
                 }
             }
@@ -964,6 +1020,17 @@ pub(crate) mod symphonia_decoder {
 
             let (rate, channels) = self.backend.output();
             let frames = self.pcm.len() / usize::from(channels.max(1));
+
+            // What the decoder said before it had seen a packet was a guess. Windows offers a
+            // placeholder output format up front and only names the stream's real one once it has
+            // decoded a frame or two, so the rate and channel count are brought up to date here as
+            // well as on the buffer — `codec_params` is what the rest of atome reads to decide an
+            // asset's rate, and leaving it at the guess had a 22 050 Hz mono file recorded as
+            // 44 100 Hz stereo.
+            if self.params.sample_rate != Some(rate) {
+                self.params.sample_rate = Some(rate);
+                self.params.channels = Some(Channels::Discrete(channels));
+            }
 
             if self.buffer.capacity() < frames || self.buffer.spec().rate() != rate {
                 self.buffer = AudioBuffer::new(spec(rate, channels), frames.max(1));

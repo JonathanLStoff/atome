@@ -29,7 +29,7 @@ pub use utils::{
 /// device actually decides. If the device then picks a period *larger* than
 /// this, the ring cannot hold a whole callback and every callback gets a
 /// partially filled buffer. Pass an explicit `buffer_size` to make the two match.
-const DEFAULT_BUFFER_FRAMES: i32 = 1024;
+pub(crate) const DEFAULT_BUFFER_FRAMES: i32 = 1024;
 
 /// How many `MixCommand`s can be queued before `add_samples` starts refusing.
 const COMMAND_QUEUE_LEN: usize = 256;
@@ -74,6 +74,43 @@ pub struct OutputClass<S: SampleType> {
     sample_type: PhantomData<S>,
 }
 
+/// As [`OutputClass::resample`], writing into `out` instead of returning a fresh `Vec`.
+///
+/// `out` is cleared and refilled, so a caller that keeps one buffer around and hands it back each
+/// time allocates once rather than per call — which is what the capture callback needs, since it
+/// runs on the audio thread.
+pub(crate) fn resample_into<S: SampleType>(
+    samples: &[S],
+    frames: usize,
+    channels: usize,
+    from: u32,
+    to: u32,
+    out: &mut Vec<S>,
+) {
+    out.clear();
+    if frames == 0 || from == 0 || to == 0 {
+        return;
+    }
+
+    let ratio = to as f64 / from as f64;
+    let out_frames = ((frames as f64) * ratio).round().max(1.0) as usize;
+    let last = frames - 1;
+
+    out.reserve(out_frames * channels);
+    for frame in 0..out_frames {
+        // Where this output frame lands on the input timeline.
+        let position = frame as f64 / ratio;
+        let left = (position.floor() as usize).min(last);
+        let right = (left + 1).min(last);
+        let t = (position - position.floor()) as f32;
+        for channel in 0..channels {
+            let a = samples[left * channels + channel].to_f32();
+            let b = samples[right * channels + channel].to_f32();
+            out.push(S::from_f32(a + (b - a) * t));
+        }
+    }
+}
+
 /// The rates to try for an output whose device will not take the one it was asked for: only rates
 /// above it, nearest first.
 ///
@@ -84,7 +121,7 @@ pub struct OutputClass<S: SampleType> {
 ///
 /// `native` is left out: the caller tries the rate the device is already running at first, that
 /// being the one most likely to work.
-fn fallback_rates(wanted: SampleRate, native: Option<SampleRate>) -> Vec<SampleRate> {
+pub(crate) fn fallback_rates(wanted: SampleRate, native: Option<SampleRate>) -> Vec<SampleRate> {
     let mut higher: Vec<SampleRate> = SampleRate::ALL
         .into_iter()
         .filter(|rate| rate.hz() > wanted.hz() && Some(*rate) != native)
@@ -557,26 +594,8 @@ impl<S: SampleType> OutputClass<S> {
     /// into the audible range, so low-pass filter first if the source has real
     /// content up there.
     fn resample(samples: &[S], frames: usize, channels: usize, from: u32, to: u32) -> Vec<S> {
-        if frames == 0 {
-            return Vec::new();
-        }
-        let ratio = to as f64 / from as f64;
-        let out_frames = ((frames as f64) * ratio).round().max(1.0) as usize;
-        let last = frames - 1;
-
-        let mut out = Vec::with_capacity(out_frames * channels);
-        for frame in 0..out_frames {
-            // Where this output frame lands on the input timeline.
-            let position = frame as f64 / ratio;
-            let left = (position.floor() as usize).min(last);
-            let right = (left + 1).min(last);
-            let t = (position - position.floor()) as f32;
-            for channel in 0..channels {
-                let a = samples[left * channels + channel].to_f32();
-                let b = samples[right * channels + channel].to_f32();
-                out.push(S::from_f32(a + (b - a) * t));
-            }
-        }
+        let mut out = Vec::new();
+        resample_into(samples, frames, channels, from, to, &mut out);
         out
     }
 

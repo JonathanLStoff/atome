@@ -571,14 +571,19 @@ fn pump<S: crate::output::SampleType, W: Write + Seek>(
     bits: u8,
     convert: impl Fn(S) -> i32,
 ) -> Result<FlacSummary, Error> {
-    let channels = stream.channels();
-    let mut writer = open(stream.sample_rate(), channels, bits)?;
+    let mut block = vec![S::SILENCE; CHUNK_FRAMES * usize::from(stream.channels().max(1))];
 
-    let mut block = vec![S::SILENCE; CHUNK_FRAMES * usize::from(channels.max(1))];
+    // One block before the writer, so the header holds the rate the decoder settled on rather
+    // than the one it offered before it had decoded anything — a 22 050 Hz AAC file is announced
+    // as 44 100 Hz by Windows's decoder until the first frames are through it.
+    let first = stream.read(&mut block)?;
+    let (channels, rate) = (stream.channels(), stream.sample_rate());
+    let mut writer = open(rate, channels, bits)?;
+
     let mut samples = Vec::with_capacity(block.len());
+    let mut read = first;
 
     loop {
-        let read = stream.read(&mut block)?;
         if read == 0 {
             break;
         }
@@ -586,6 +591,8 @@ fn pump<S: crate::output::SampleType, W: Write + Seek>(
         samples.clear();
         samples.extend(block[..read].iter().map(|sample| convert(*sample)));
         writer.write(&samples)?;
+
+        read = stream.read(&mut block)?;
     }
 
     writer.finish()

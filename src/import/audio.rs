@@ -408,6 +408,17 @@ mod backend {
             emitted += append(samples, &buffer, room) as u64;
         }
 
+        // What the decoder knows once it has decoded something, which is not always what it said
+        // before it had: an OS AAC decoder offers a placeholder format up front and names the
+        // stream's real one only after a frame or two. The header's word stands for an empty file.
+        let settled = decoder.codec_params();
+        let sample_rate = settled.sample_rate.unwrap_or(sample_rate);
+        let channels = settled
+            .channels
+            .as_ref()
+            .map(|channels| channels.count() as u16)
+            .unwrap_or(channels);
+
         Ok(Decoded {
             // An empty file never produced a packet, so the header's word is
             // all there is.
@@ -555,11 +566,20 @@ mod backend {
 
     impl<S: SampleType> AudioStream<S> for SymphoniaStream<S> {
         fn sample_rate(&self) -> u32 {
-            self.sample_rate
+            // The decoder's word where it has one: see `decode` on why what it says before the
+            // first packet can be a placeholder.
+            self.decoder.codec_params().sample_rate.unwrap_or(self.sample_rate)
         }
 
         fn channels(&self) -> u16 {
-            self.channels
+            // As `sample_rate`: the decoder's word where it has one. A placeholder channel count
+            // left here wrote a mono file into a stereo FLAC header, halving its length.
+            self.decoder
+                .codec_params()
+                .channels
+                .as_ref()
+                .map(|channels| channels.count() as u16)
+                .unwrap_or(self.channels)
         }
 
         fn total_frames(&self) -> Option<u64> {
