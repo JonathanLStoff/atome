@@ -331,36 +331,60 @@ impl<S: SampleType> InputClass<S> {
 #[cfg(test)]
 mod rate_tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
 
-    /// Every input hands the callback audio at the rate that was asked for, whatever rate the
-    /// device itself runs at.
+    /// Whether cpal will open `device` for capture at `rate`, asked for exactly as
+    /// [`InputClass`] asks: the device's own channel count, and the same buffer. The stream is
+    /// dropped before this returns, so nothing is held while the real one is built — an exclusive
+    /// device cannot be opened twice at once.
+    fn opens_at(device: &Device, rate: SampleRate) -> bool {
+        let channels = device.default_input_config().map(|config| config.channels()).unwrap_or(1);
+        let config = StreamConfig {
+            channels,
+            sample_rate: rate.hz(),
+            buffer_size: cpal::BufferSize::Fixed(512),
+        };
+
+        device
+            .build_input_stream(
+                config,
+                |_data: &[f32], _info: &cpal::InputCallbackInfo| {},
+                |_error| {},
+                None,
+            )
+            .is_ok()
+    }
+
+    /// An input hands the callback the rate that was asked for, and moves the device off that rate
+    /// only where the device will not take it.
     ///
-    /// A capture device gets no conversion from the host, so a 48 kHz microphone refuses 44.1 kHz
-    /// outright — the engine still gets 44.1 kHz from it, because the gap is closed here. The
-    /// counts are compared as frames per callback, scaled by the rate: a device opened at 48 kHz
-    /// and delivered at 44.1 kHz hands over fewer frames than it captured.
+    /// The second half is the part worth guarding. Windows pins a capture device to the rate it is
+    /// already running at, so the engine's rate is reached by resampling; ALSA's `null` and `plug`
+    /// devices take any rate, so there is nothing to resample and nothing should move. Both are
+    /// right, and which one a machine does is not this test's business — that the engine is handed
+    /// its rate either way, and that nothing is resampled needlessly, is.
     ///
     /// A machine with no input device tests nothing and still passes.
     #[test]
-    fn an_input_delivers_the_rate_that_was_asked_for() {
+    fn an_input_runs_at_the_rate_asked_for_and_moves_only_when_it_must() {
         let Ok(devices) = list_devices(None) else { return };
 
         for device in devices.iter() {
             let name = device.to_string();
-            for asked in [SampleRate::Hz44_1k, SampleRate::Hz48k] {
-                let frames = Arc::new(AtomicUsize::new(0));
-                let seen = Arc::clone(&frames);
 
+            for asked in [SampleRate::Hz44_1k, SampleRate::Hz48k] {
+                // Asked before the real stream exists, for the reason in `opens_at`. Twice: a
+                // device that is busy for a moment fails the first ask and would be mistaken for
+                // one that refuses the rate, where a real refusal is a format error and fails
+                // both.
+                let natively = opens_at(device, asked) || opens_at(device, asked);
+
+                // `InputType` only labels the device; the host it came from is `list_devices`'s.
                 let mut input = InputClass::<f32>::new(
                     Some(device.clone()),
                     InputType::WASAPI,
                     asked,
                     Some(512),
-                    move |data: &[f32]| {
-                        seen.fetch_add(data.len(), Ordering::Relaxed);
-                    },
+                    |_data: &[f32]| {},
                 );
 
                 if input.build_stream().is_err() {
@@ -368,51 +392,33 @@ mod rate_tests {
                     continue;
                 }
 
-                // Whatever the device runs at, the engine was promised `asked`.
                 assert_eq!(
                     input.sample_rate(),
                     asked.hz() as i32,
-                    "{name} reported a rate other than the one asked for"
+                    "{name}: the engine is handed a rate other than the one it asked for"
                 );
                 assert!(
                     SampleRate::from_hz(input.device_rate() as u32).is_some(),
-                    "{name} opened at {} Hz, which is not one of atome's rates",
+                    "{name}: opened at {} Hz, which is not one of atome's rates",
                     input.device_rate()
                 );
 
-                let _ = frames;
+                if natively {
+                    assert_eq!(
+                        input.device_rate(),
+                        asked.hz() as i32,
+                        "{name} takes {} Hz, so nothing should have been resampled",
+                        asked.hz()
+                    );
+                } else {
+                    assert_ne!(
+                        input.device_rate(),
+                        asked.hz() as i32,
+                        "{name} will not take {} Hz, so it should be running at its own",
+                        asked.hz()
+                    );
+                }
             }
-        }
-    }
-
-    /// The device this machine pins to 48 kHz is still opened for a 44.1 kHz engine, by running at
-    /// 48 kHz underneath. Skipped where no device is pinned that way.
-    #[test]
-    fn a_device_that_refuses_the_rate_runs_at_its_own_instead() {
-        let Ok(devices) = list_devices(None) else { return };
-
-        for device in devices.iter() {
-            let own = device.default_input_config().map(|config| config.sample_rate()).unwrap_or(0);
-            // A device already at 44.1 kHz proves nothing here.
-            if own != SampleRate::Hz48k.hz() {
-                continue;
-            }
-
-            let mut input = InputClass::<f32>::new(
-                Some(device.clone()),
-                InputType::WASAPI,
-                SampleRate::Hz44_1k,
-                Some(512),
-                |_data: &[f32]| {},
-            );
-
-            if input.build_stream().is_err() {
-                continue;
-            }
-
-            assert_eq!(input.sample_rate(), 44_100, "the engine asked for 44.1 kHz");
-            assert_eq!(input.device_rate(), 48_000, "{device} runs at its own 48 kHz underneath");
-            return;
         }
     }
 }
