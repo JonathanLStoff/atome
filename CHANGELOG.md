@@ -8,6 +8,22 @@ underneath it, so **Done** always holds exactly what is unreleased.
 
 **Done**
 
+- **Streams seek, to the sample.** `AudioStream::seek(frame)` moves a stream
+  so the next `read` starts exactly at `frame` (per channel, from the start;
+  past the end is the end) and says where it is. Symphonia streams ask the
+  container for the packet at or before it, ask again from further back if
+  it lands late, then decode forward and drop what comes first. Each seek
+  opens the container again from the top: Symphonia 0.6's FLAC reader keeps
+  the fragments it read ahead across a seek that lands exactly on a frame
+  (every seek back to the start does), and after the first packet the audio
+  jumped back to where it had been. ADTS rewinds and decodes forward. Other
+  streams refuse with `UnsupportedOperation`, the trait's default. 6 tests
+- **`import::Section`: in and out points, and gapless loops.** A stream from
+  one frame to another (`None`: its end), once or round and round. Looping,
+  the end of a pass seeks back to the start inside the same `read`, so
+  whatever schedules the samples sees one unbroken run: no gap at the seam.
+  `passes()` counts the turns; a looping section never ends. 4 tests
+
 - **Sounds scheduled after a quiet stretch play on time.** The mixer used to
   stop moving its cursor whenever it had nothing to play, while the
   `PlayClock` kept counting. Anything scheduled off the clock after more than

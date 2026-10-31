@@ -44,6 +44,9 @@ use std::path::Path;
 use crate::output::SampleType;
 
 pub mod audio;
+mod section;
+
+pub use section::Section;
 
 #[cfg(feature = "import")]
 mod aac;
@@ -344,6 +347,25 @@ pub trait AudioStream<S: SampleType>: Send {
     /// frame at the end of a block would leave the channels interleaved out of
     /// step.
     fn read(&mut self, out: &mut [S]) -> Result<usize, Error>;
+
+    /// Moves to `frame` — counted per channel from the start of the audio, as
+    /// [`total_frames`](Self::total_frames) counts — so the next
+    /// [`read`](Self::read) starts exactly there. Returns the frame it is at
+    /// now: `frame`, or the end for one past it.
+    ///
+    /// Exact to the sample: the container is asked for the packet at or
+    /// before `frame`, and what that packet holds before it is decoded and
+    /// thrown away.
+    ///
+    /// Fails with [`ErrorKind::UnsupportedOperation`] for a stream that
+    /// cannot move, which is the default.
+    fn seek(&mut self, frame: u64) -> Result<u64, Error> {
+        let _ = frame;
+        Err(Error::with_message(
+            ErrorKind::UnsupportedOperation,
+            "this stream cannot seek",
+        ))
+    }
 }
 
 /// Samples per block when draining a stream into memory.

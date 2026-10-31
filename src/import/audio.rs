@@ -91,7 +91,8 @@ mod backend {
     use symphonia::core::codecs::registry::CodecRegistry;
     use symphonia::core::errors::Error as SymphoniaError;
     use symphonia::core::formats::probe::Hint;
-    use symphonia::core::formats::{FormatOptions, FormatReader, TrackType};
+    use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
+    use symphonia::core::units::{Time, TimeBase};
     use symphonia::core::io::{MediaSource, MediaSourceStream};
     use symphonia::core::meta::MetadataOptions;
 
@@ -167,11 +168,17 @@ mod backend {
     /// A decoder and the demuxer feeding it, plus whatever the last decoded
     /// packet produced that the caller has not taken yet.
     struct SymphoniaStream<S: SampleType> {
-        format: Box<dyn FormatReader>,
+        /// `None` only for the moment a seek opens it again (`seek`).
+        format: Option<Box<dyn FormatReader>>,
         decoder: Box<dyn AudioDecoder>,
         /// Packets from other tracks — a video track, a second language — are
         /// skipped rather than fed to a decoder that would reject them.
         track_id: u32,
+        /// What the track's timestamps count in: how a packet's time becomes a
+        /// frame, for seeking.
+        time_base: Option<TimeBase>,
+        /// The frame `pending` starts at, where the packet said.
+        pending_at: Option<u64>,
         sample_rate: u32,
         channels: u16,
         total_frames: Option<u64>,
@@ -207,6 +214,8 @@ mod backend {
         format: Box<dyn FormatReader>,
         decoder: Box<dyn AudioDecoder>,
         track_id: u32,
+        /// What the track's timestamps count in, for seeking.
+        time_base: Option<TimeBase>,
         sample_rate: u32,
         channels: u16,
         total_frames: Option<u64>,
@@ -253,6 +262,7 @@ mod backend {
 
         let track_id = track.id;
         let total_frames = track.num_frames;
+        let time_base = track.time_base;
 
         let params = track
             .codec_params
@@ -292,6 +302,7 @@ mod backend {
             format,
             decoder,
             track_id,
+            time_base,
             sample_rate,
             channels: channels as u16,
             total_frames,
@@ -365,6 +376,7 @@ mod backend {
             mut format,
             mut decoder,
             track_id,
+            time_base: _,
             sample_rate,
             channels,
             total_frames,
@@ -496,6 +508,7 @@ mod backend {
                 format,
                 decoder,
                 track_id,
+                time_base,
                 sample_rate,
                 channels,
                 total_frames,
@@ -503,9 +516,11 @@ mod backend {
             } = opened;
 
             SymphoniaStream {
-                format,
+                format: Some(format),
                 decoder,
                 track_id,
+                time_base,
+                pending_at: None,
                 sample_rate,
                 channels,
                 total_frames,
@@ -523,7 +538,8 @@ mod backend {
         /// Returns `false` at the end of the track.
         fn decode_next(&mut self) -> Result<bool, Error> {
             loop {
-                let packet = match self.format.next_packet() {
+                let Some(format) = self.format.as_mut() else { return Ok(false) };
+                let packet = match format.next_packet() {
                     Ok(Some(packet)) => packet,
                     Ok(None) => return Ok(false),
                     // A reset means the track list changed underneath us, which
@@ -536,9 +552,11 @@ mod backend {
                 if packet.track_id != self.track_id {
                     continue;
                 }
+                let at = self.frame_of(packet.pts);
 
                 match self.decoder.decode(&packet) {
                     Ok(decoded) => {
+                        self.pending_at = at;
                         self.scratch.clear();
                         decoded.copy_to_vec_interleaved(&mut self.scratch);
 
@@ -564,7 +582,91 @@ mod backend {
         }
     }
 
+    impl<S: SampleType> SymphoniaStream<S> {
+        /// The container read again from the top: a reader that has never been
+        /// read from, for a seek to land in.
+        ///
+        /// Symphonia's FLAC reader keeps the fragments it had read ahead
+        /// across a seek that lands exactly on a frame (as every seek back to
+        /// the start does), and hands them out after the first packet — the
+        /// audio jumps back to where it was. A fresh reader has nothing to
+        /// hand out. Costs one look at the header.
+        fn reopen(&mut self) -> Result<(), Error> {
+            let format = self
+                .format
+                .take()
+                .ok_or_else(|| Error::with_message(ErrorKind::Other, "the stream was lost in an earlier seek"))?;
+            let mut source = format.into_inner();
+            std::io::Seek::seek(&mut source, std::io::SeekFrom::Start(0))
+                .map_err(|error| Error::with_message(ErrorKind::Other, format!("could not seek: {error}")))?;
+            let format = symphonia::default::get_probe()
+                .probe(&Hint::new(), source, FormatOptions::default(), MetadataOptions::default())
+                .map_err(|error| stream_failed("seeking", error))?;
+            self.format = Some(format);
+            Ok(())
+        }
+
+        /// The frame a timestamp of the track is at, at the rate it decodes to.
+        fn frame_of(&self, ts: symphonia::core::units::Timestamp) -> Option<u64> {
+            let time = self.time_base?.calc_time(ts)?;
+            let rate = f64::from(AudioStream::<S>::sample_rate(self));
+            Some((time.as_secs_f64().max(0.0) * rate).round() as u64)
+        }
+    }
+
     impl<S: SampleType> AudioStream<S> for SymphoniaStream<S> {
+        fn seek(&mut self, frame: u64) -> Result<u64, Error> {
+            let channels = u64::from(AudioStream::<S>::channels(self).max(1));
+            let rate = f64::from(AudioStream::<S>::sample_rate(self).max(1));
+            let frame = self.total_frames.map_or(frame, |total| frame.min(total));
+
+            // Asked for `frame`, a container can still land a packet late (on
+            // a block boundary, by rounding): then it is asked again from
+            // further back, until the packet starts at or before `frame`.
+            let mut back = 0_u64;
+            loop {
+                let from = frame.saturating_sub(back);
+                let time = Time::try_from_secs_f64(from as f64 / rate)
+                    .ok_or_else(|| Error::with_message(ErrorKind::InvalidInput, format!("frame {frame} is out of range")))?;
+                self.reopen()?;
+                self.format
+                    .as_mut()
+                    .ok_or_else(|| Error::with_message(ErrorKind::Other, "the stream was lost in an earlier seek"))?
+                    .seek(SeekMode::Accurate, SeekTo::Time { time, track_id: Some(self.track_id) })
+                    .map_err(|error| stream_failed("seeking", error))?;
+                self.decoder.reset();
+                self.pending.clear();
+                self.taken = 0;
+                self.pending_at = None;
+
+                if !self.decode_next()? {
+                    break;
+                }
+                match self.pending_at {
+                    Some(start) if start > frame && from > 0 => back = (back * 2).max(4_096),
+                    _ => break,
+                }
+            }
+            self.emitted = frame.saturating_mul(channels);
+
+            // Now at or before `frame`: decode forward and drop what comes
+            // first, so the next read is exact.
+            while let Some(start) = self.pending_at {
+                let frames = (self.pending.len() as u64) / channels;
+                if start + frames > frame {
+                    self.taken = (frame.saturating_sub(start) * channels) as usize;
+                    break;
+                }
+                if !self.decode_next()? {
+                    self.pending.clear();
+                    self.taken = 0;
+                    break;
+                }
+            }
+
+            Ok(frame)
+        }
+
         fn sample_rate(&self) -> u32 {
             // The decoder's word where it has one: see `decode` on why what it says before the
             // first packet can be a placeholder.

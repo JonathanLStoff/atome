@@ -1059,6 +1059,10 @@ pub(crate) mod symphonia_decoder {
 pub(crate) struct AdtsStream {
     data: Vec<u8>,
     cursor: usize,
+    /// The stream's AudioSpecificConfig, to start the decoder again on a seek.
+    asc: Vec<u8>,
+    /// Frames handed over since the start, so a seek knows how far to go.
+    frame: u64,
     backend: Box<dyn Backend>,
     pending: Vec<f32>,
     taken: usize,
@@ -1082,6 +1086,8 @@ impl AdtsStream {
         Ok(AdtsStream {
             data,
             cursor: 0,
+            asc: asc.to_vec(),
+            frame: 0,
             backend,
             pending: Vec::new(),
             taken: 0,
@@ -1146,8 +1152,41 @@ impl<S: SampleType> AudioStream<S> for AdtsStream {
             *slot = S::from_f32(*sample);
         }
         self.taken += count;
+        self.frame += (count / channels) as u64;
 
         Ok(count)
+    }
+
+    /// ADTS has no index: back to the top with a fresh decoder (it carries
+    /// state from frame to frame), then decoded forward to `frame`.
+    fn seek(&mut self, frame: u64) -> Result<u64, Error> {
+        if frame < self.frame {
+            self.backend = open(&self.asc).map_err(|reason| Error::with_message(ErrorKind::UnsupportedOperation, reason))?;
+            self.cursor = 0;
+            self.frame = 0;
+            self.pending.clear();
+            self.taken = 0;
+        }
+
+        let channels = usize::from(self.channels.max(1));
+        while self.frame < frame {
+            if self.taken >= self.pending.len() {
+                let Some((start, end)) = self.next_frame() else { break };
+                self.pending.clear();
+                self.taken = 0;
+                let packet = self.data[start..end].to_vec();
+                self.backend
+                    .decode(&packet, &mut self.pending)
+                    .map_err(|reason| Error::with_message(ErrorKind::Other, reason))?;
+                continue;
+            }
+            let frames = ((self.pending.len() - self.taken) / channels) as u64;
+            let skip = frames.min(frame - self.frame);
+            self.taken += skip as usize * channels;
+            self.frame += skip;
+        }
+
+        Ok(self.frame)
     }
 }
 
