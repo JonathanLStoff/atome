@@ -8,6 +8,27 @@ underneath it, so **Done** always holds exactly what is unreleased.
 
 **Done**
 
+## Release 0.8.10
+
+- **Linux and Android have a host.** `OutputType` had Windows' APIs and
+  CoreAudio only, so an application choosing a type by platform had none to
+  give a device on Linux or Android and could not build an engine there. It
+  gains `ALSA` and `AAudio`, `OutputType::native()` (the platform's usual API)
+  and `OutputType::from_host_name` (from cpal's name for a host). The type is
+  a label: which devices exist is still decided by the `cpal::Host` they were
+  listed from. Compile-checked for Android, iOS and Windows
+- **A voice's level can be changed while it plays.** `Scheduler::set_gain(voice,
+  gain, over)` brings a voice to a linear level over a time (zero: at once),
+  from wherever it is, and holds it for what the voice schedules afterwards.
+  `Scheduler::fade_out(voice, over)` ramps to silence and then takes the voice
+  back, as `cancel` does: a stop that does not click. Both act in the mixer on
+  samples the device has not been handed yet, so they are heard within a
+  buffer however far ahead the voice is scheduled. Every channel of a frame
+  gets one gain; a voice at one costs nothing. 4 tests in `output/mixer.rs`
+- **`Scheduler::aligner()`: `align` with nothing allocated per block.** An
+  `Aligner` keeps its buffers between calls, and hands a block that is already
+  at the output's rate and channel count straight back, not copied.
+  `Aligner::matches` says when that is. 2 tests in `output/scheduler.rs`
 - **Streams seek, to the sample.** `AudioStream::seek(frame)` moves a stream
   so the next `read` starts exactly at `frame` (per channel, from the start;
   past the end is the end) and says where it is. Symphonia streams ask the

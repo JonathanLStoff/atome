@@ -2,6 +2,8 @@
 
 use cpal::{FromSample, Sample, SampleFormat, SizedSample};
 
+/// The platform audio API a device is reached through. A label: which devices
+/// exist is decided by the `cpal::Host` they were listed from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutputType {
     // Windows
@@ -10,8 +12,47 @@ pub enum OutputType {
     DirectSound,
     WDMKS,
     MME,
-    // macOS
+    // macOS, iOS
     CoreAudio,
+    // Linux
+    ALSA,
+    // Android
+    AAudio,
+}
+
+impl OutputType {
+    /// The API this platform's audio normally goes through: WASAPI on Windows,
+    /// CoreAudio on Apple's systems, AAudio on Android, ALSA on Linux and
+    /// anything else.
+    pub fn native() -> Self {
+        if cfg!(target_os = "windows") {
+            OutputType::WASAPI
+        } else if cfg!(target_vendor = "apple") {
+            OutputType::CoreAudio
+        } else if cfg!(target_os = "android") {
+            OutputType::AAudio
+        } else {
+            OutputType::ALSA
+        }
+    }
+
+    /// The type a host's name stands for, as `cpal::HostId::name` spells it
+    /// (`"CoreAudio"`, `"WASAPI"`, `"ALSA"`, `"AAudio"`, …), whatever its
+    /// case. `None` for a host atome has no label for (JACK, PipeWire):
+    /// [`native`](Self::native) is the label to fall back on.
+    pub fn from_host_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "asio" => Some(OutputType::ASIO),
+            "wasapi" => Some(OutputType::WASAPI),
+            "directsound" => Some(OutputType::DirectSound),
+            "wdmks" | "wdm-ks" => Some(OutputType::WDMKS),
+            "mme" => Some(OutputType::MME),
+            "coreaudio" => Some(OutputType::CoreAudio),
+            "alsa" => Some(OutputType::ALSA),
+            "aaudio" => Some(OutputType::AAudio),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

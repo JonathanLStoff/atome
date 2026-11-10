@@ -13,8 +13,8 @@ pub mod types;
 pub mod utils;
 
 pub use clock::PlayClock;
-pub use mixer::{ClearSignal, MixCommand, Mixer, MixerHandle, Voices};
-pub use scheduler::Scheduler;
+pub use mixer::{ClearSignal, GainChange, MixCommand, Mixer, MixerHandle, Voices};
+pub use scheduler::{Aligner, Scheduler};
 pub use types::{OutputType, SampleRate, SampleType};
 pub use utils::{
     default_device, device_name, find_device, get_host_by_id, get_host_by_name, get_host_in_name,
@@ -557,7 +557,14 @@ impl<S: SampleType> OutputClass<S> {
     /// stereo keeps front-left/front-right and loses the rest rather than
     /// folding them in.
     fn map_channels(samples: &[S], frames: usize, src_channels: usize, dst_channels: usize) -> Vec<S> {
-        let mut out = Vec::with_capacity(frames * dst_channels);
+        let mut out = Vec::new();
+        Self::map_channels_into(samples, frames, src_channels, dst_channels, &mut out);
+        out
+    }
+
+    /// [`map_channels`](Self::map_channels), appended to `out`.
+    pub(crate) fn map_channels_into(samples: &[S], frames: usize, src_channels: usize, dst_channels: usize, out: &mut Vec<S>) {
+        out.reserve(frames * dst_channels);
         for frame in 0..frames {
             let start = frame * src_channels;
             if src_channels == 1 {
@@ -582,7 +589,6 @@ impl<S: SampleType> OutputClass<S> {
                 }
             }
         }
-        out
     }
 
     /// Resamples interleaved `frames` from `from` Hz to `to` Hz, linearly

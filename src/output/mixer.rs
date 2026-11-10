@@ -92,10 +92,64 @@ pub struct MixCommand<S: SampleType> {
     pub voice: Option<u64>,
 }
 
-/// Voices to take back, shared between whoever schedules and the mixer.
+/// "Bring this voice to this level, over this long."
+///
+/// `samples` is the length of the ramp in interleaved samples (`frames *
+/// channels`), as indexes are; `0` is at once. With `then_cancel`, the voice is
+/// taken back when the ramp ends: a fade out.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GainChange {
+    pub voice: u64,
+    /// Linear: `1.0` is as scheduled, `0.0` silent.
+    pub gain: f32,
+    pub samples: usize,
+    /// The stream's channel count, so every channel of a frame gets one gain.
+    pub channels: usize,
+    pub then_cancel: bool,
+}
+
+/// A voice's level: where it is going, and how far along it is.
+#[derive(Clone, Copy, Debug)]
+struct Ramp {
+    from: f32,
+    to: f32,
+    /// Absolute interleaved index the ramp starts at, and how long it is.
+    start: usize,
+    len: usize,
+    channels: usize,
+    then_cancel: bool,
+    /// The cursor when the voice last had samples waiting, to forget a voice
+    /// that has long since played out.
+    seen: usize,
+}
+
+impl Ramp {
+    /// The gain at absolute interleaved index `at`: linear from `from` to `to`
+    /// across the ramp, a frame at a time.
+    fn at(&self, at: usize) -> f32 {
+        if at >= self.start + self.len {
+            return self.to;
+        }
+        if at <= self.start {
+            return self.from;
+        }
+        let channels = self.channels.max(1);
+        let frames = (self.len / channels).max(1);
+        let frame = (at - self.start) / channels;
+        self.from + (self.to - self.from) * (frame as f32 / frames as f32)
+    }
+
+    fn done(&self, cursor: usize) -> bool {
+        cursor >= self.start + self.len
+    }
+}
+
+/// Voices to take back or to change the level of, shared between whoever
+/// schedules and the mixer.
 #[derive(Debug, Default)]
 pub struct Voices {
     cancelled: Mutex<Vec<u64>>,
+    gains: Mutex<Vec<GainChange>>,
 }
 
 impl Voices {
@@ -110,6 +164,19 @@ impl Voices {
 
     fn take(&self) -> Vec<u64> {
         std::mem::take(&mut *self.cancelled.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Changes a voice's level. Picked up on the mixer's next pass, so it is
+    /// heard one buffer later: what has been handed to the device is as it was.
+    pub fn gain(&self, change: GainChange) {
+        self.gains
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(change);
+    }
+
+    fn take_gains(&self) -> Vec<GainChange> {
+        std::mem::take(&mut *self.gains.lock().unwrap_or_else(PoisonError::into_inner))
     }
 }
 
@@ -142,6 +209,8 @@ pub struct Mixer<S: SampleType> {
     voices: HashMap<u64, Vec<(usize, Vec<S>)>>,
     /// Voices to take back.
     cancels: Arc<Voices>,
+    /// The level of each voice that is not simply as scheduled.
+    gains: HashMap<u64, Ramp>,
 }
 
 impl<S: SampleType> Mixer<S> {
@@ -157,6 +226,7 @@ impl<S: SampleType> Mixer<S> {
             cleared: 0,
             voices: HashMap::new(),
             cancels: Arc::new(Voices::default()),
+            gains: HashMap::new(),
         }
     }
 
@@ -179,6 +249,25 @@ impl<S: SampleType> Mixer<S> {
         self.commands.clear();
         self.mix.clear();
         self.voices.clear();
+        self.gains.clear();
+    }
+
+    /// Starts a voice towards a new level from wherever it is now.
+    fn apply_gain(&mut self, change: GainChange) {
+        let from = self.gains.get(&change.voice).map_or(1.0, |ramp| ramp.at(self.cursor));
+        let to = if change.gain.is_finite() { change.gain.max(0.0) } else { 1.0 };
+        self.gains.insert(
+            change.voice,
+            Ramp {
+                from,
+                to,
+                start: self.cursor,
+                len: change.samples,
+                channels: change.channels,
+                then_cancel: change.then_cancel,
+                seen: self.cursor,
+            },
+        );
     }
 
     /// Sum one command into the accumulation buffer.
@@ -227,19 +316,55 @@ impl<S: SampleType> Mixer<S> {
     fn commit_voices(&mut self, ready: usize) {
         let (from, to) = (self.cursor, self.cursor + ready);
 
-        for segments in self.voices.values_mut() {
+        for (voice, segments) in self.voices.iter_mut() {
+            let ramp = self.gains.get_mut(voice);
+            // A voice at a steady level of one needs no arithmetic at all.
+            let level = ramp.as_deref().copied();
+
             for (index, samples) in segments.iter() {
                 let (start, end) = (*index, index + samples.len());
                 let (low, high) = (start.max(from), end.min(to));
 
-                for absolute in low..high {
-                    let slot = &mut self.mix[absolute - from];
-                    *slot = slot.mix(samples[absolute - start]);
+                match level {
+                    None => {
+                        for absolute in low..high {
+                            let slot = &mut self.mix[absolute - from];
+                            *slot = slot.mix(samples[absolute - start]);
+                        }
+                    }
+                    Some(ramp) => {
+                        for absolute in low..high {
+                            let gain = ramp.at(absolute);
+                            let sample = samples[absolute - start];
+                            // The float round-trip only where the level is not one.
+                            let sample = if gain == 1.0 { sample } else { S::from_f32(sample.to_f32() * gain) };
+                            let slot = &mut self.mix[absolute - from];
+                            *slot = slot.mix(sample);
+                        }
+                    }
                 }
             }
 
             segments.retain(|(index, samples)| index + samples.len() > to);
+            if let Some(ramp) = ramp {
+                ramp.seen = to;
+            }
         }
+
+        // A fade out that has run its course takes its voice with it; a ramp
+        // that ended back at one, or whose voice played out long ago, is
+        // forgotten.
+        let voices = &mut self.voices;
+        self.gains.retain(|voice, ramp| {
+            if !ramp.done(to) {
+                return true;
+            }
+            if ramp.then_cancel {
+                voices.remove(voice);
+                return false;
+            }
+            ramp.to != 1.0 && to.saturating_sub(ramp.seen) < MAX_SCHEDULE_AHEAD
+        });
 
         self.voices.retain(|_, segments| !segments.is_empty());
     }
@@ -293,6 +418,12 @@ impl<S: SampleType> Mixer<S> {
 
         for voice in self.cancels.take() {
             self.voices.remove(&voice);
+            self.gains.remove(&voice);
+            worked = true;
+        }
+
+        for change in self.cancels.take_gains() {
+            self.apply_gain(change);
             worked = true;
         }
 
@@ -442,6 +573,86 @@ mod tests {
         let mut second = [0.0; 4];
         device.pop_slice(&mut second);
         assert_eq!(second, [0.25; 4], "the voice is gone, the rest is not");
+    }
+
+    fn gain(voice: u64, gain: f32, samples: usize, then_cancel: bool) -> GainChange {
+        GainChange { voice, gain, samples, channels: 2, then_cancel }
+    }
+
+    /// A level set at once holds for everything the voice plays after it, and
+    /// nothing else in the mix is touched.
+    #[test]
+    fn a_voice_plays_at_the_level_it_is_set_to() {
+        let (mut commands, mut mixer, mut device) = mixer(4);
+        let _ = commands.try_push(command(0, vec![0.25; 8], None));
+        let _ = commands.try_push(command(0, vec![0.5; 8], Some(3)));
+        mixer.voices().gain(gain(3, 0.5, 0, false));
+
+        let mut heard = [0.0; 4];
+        for _ in 0..2 {
+            mixer.tick();
+            device.pop_slice(&mut heard);
+            assert_eq!(heard, [0.5; 4], "0.25 and half of 0.5");
+        }
+    }
+
+    /// A ramp moves a frame at a time, both channels of a frame together, and
+    /// ends on the level asked for.
+    #[test]
+    fn a_ramp_goes_from_where_the_voice_is_to_the_new_level() {
+        let (mut commands, mut mixer, mut device) = mixer(16);
+        let _ = commands.try_push(command(0, vec![1.0; 16], Some(5)));
+        // Four frames of stereo.
+        mixer.voices().gain(gain(5, 0.0, 8, false));
+
+        mixer.tick();
+        let mut heard = [9.0; 16];
+        device.pop_slice(&mut heard);
+
+        assert_eq!(&heard[..8], &[1.0, 1.0, 0.75, 0.75, 0.5, 0.5, 0.25, 0.25]);
+        assert_eq!(&heard[8..], &[0.0; 8], "held at the end of the ramp");
+    }
+
+    /// A second change mid-ramp starts from the level the first had reached.
+    #[test]
+    fn a_new_level_mid_ramp_starts_from_where_the_ramp_had_got_to() {
+        let (mut commands, mut mixer, mut device) = mixer(4);
+        let _ = commands.try_push(command(0, vec![1.0; 12], Some(5)));
+        mixer.voices().gain(gain(5, 0.0, 8, false));
+
+        mixer.tick();
+        let mut heard = [9.0; 4];
+        device.pop_slice(&mut heard);
+        assert_eq!(heard, [1.0, 1.0, 0.75, 0.75]);
+
+        // Half way down: back up at once.
+        mixer.voices().gain(gain(5, 1.0, 0, false));
+        mixer.tick();
+        device.pop_slice(&mut heard);
+        assert_eq!(heard, [1.0; 4]);
+    }
+
+    /// A fade out is a ramp to nothing that takes the voice with it: what the
+    /// voice had scheduled past the fade is never heard.
+    #[test]
+    fn a_fade_out_cancels_the_voice_when_it_ends() {
+        let (mut commands, mut mixer, mut device) = mixer(4);
+        let _ = commands.try_push(command(0, vec![0.25; 12], None));
+        let _ = commands.try_push(command(0, vec![1.0; 12], Some(8)));
+        mixer.voices().gain(gain(8, 0.0, 4, true));
+
+        mixer.tick();
+        let mut heard = [9.0; 4];
+        device.pop_slice(&mut heard);
+        assert_eq!(heard, [1.25, 1.25, 0.75, 0.75]);
+
+        // Brought back up, were the voice still there, it would be heard.
+        mixer.voices().gain(gain(8, 1.0, 0, false));
+        for _ in 0..2 {
+            mixer.tick();
+            device.pop_slice(&mut heard);
+            assert_eq!(heard, [0.25; 4], "the voice went with its fade");
+        }
     }
 
     /// With nothing to play the cursor still keeps pace with the device, so a
