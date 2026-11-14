@@ -8,6 +8,21 @@ underneath it, so **Done** always holds exactly what is unreleased.
 
 **Done**
 
+## Release 0.8.11
+
+- **AU hosting links on iOS.** `au` and `au3` pulled in `truce-rack-au` 1.1.5,
+  which declares `objc2-app-kit` (for its Cocoa editor) on every Apple target,
+  so an iOS app built with either feature failed to link: `ld: framework
+  'AppKit' not found`. The two truce-rack AU crates (`truce-rack-au`,
+  `truce-rack-au3`, MIT OR Apache-2.0) are now carried in-tree as
+  `plugins::au_host` and `plugins::au3_scan`, with their own dependencies, and
+  the editor and `objc2-app-kit` are compiled for macOS only. On iOS a loaded
+  AU reports no editor; scanning, loading, rendering, MIDI, parameters,
+  presets and state are upstream's code unchanged (one let chain rewritten for
+  edition 2021). macOS behaves as before. Checked by linking an iOS executable
+  with `au3`: 0.8.10 fails with that error, this links (AudioToolbox, no
+  AppKit). Upstream's 2 tests come along in `plugins/au_host.rs`
+
 ## Release 0.8.10
 
 - **Linux and Android have a host.** `OutputType` had Windows' APIs and

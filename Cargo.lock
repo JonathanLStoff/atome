@@ -48,16 +48,21 @@ dependencies = [
 
 [[package]]
 name = "atome"
-version = "0.8.10"
+version = "0.8.11"
 dependencies = [
  "atomic-queue",
+ "block2",
  "cpal",
  "flacenc",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-audio-toolbox",
+ "objc2-core-audio-types",
+ "objc2-core-foundation",
+ "objc2-foundation",
  "ringbuf",
  "symphonia",
  "symphonia-adapter-libopus",
- "truce-rack-au",
- "truce-rack-au3",
  "truce-rack-core",
  "truce-rack-vst3",
  "windows 0.61.3",
@@ -1381,38 +1386,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2abe9b86193656635d2411dc43050282ca48aa31c2451210f4202550afb7526"
 dependencies = [
  "winnow",
-]
-
-[[package]]
-name = "truce-rack-au"
-version = "1.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e6043b72201621272fefc5ccada3db95bc27d669434c5bd34a3c000a954495a"
-dependencies = [
- "block2",
- "objc2",
- "objc2-app-kit",
- "objc2-audio-toolbox",
- "objc2-core-audio-types",
- "objc2-core-foundation",
- "objc2-foundation",
- "thiserror 2.0.19",
- "truce-rack-core",
-]
-
-[[package]]
-name = "truce-rack-au3"
-version = "1.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ede21cf2178018c4794e6c039c40e3cabe4e3d3f6f620ab5f0fd115ee44317c3"
-dependencies = [
- "objc2",
- "objc2-audio-toolbox",
- "objc2-core-foundation",
- "objc2-foundation",
- "thiserror 2.0.19",
- "truce-rack-au",
- "truce-rack-core",
 ]
 
 [[package]]

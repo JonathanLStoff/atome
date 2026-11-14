@@ -85,6 +85,12 @@ pub mod params;
 pub mod au;
 #[cfg(all(feature = "au3", target_vendor = "apple"))]
 pub mod au3;
+// The AU host itself: `truce-rack-au` / `truce-rack-au3` carried in-tree so the
+// Cocoa editor (AppKit) can be macOS-only — see `au_host`'s header.
+#[cfg(all(any(feature = "au", feature = "au3"), target_vendor = "apple"))]
+mod au_host;
+#[cfg(all(feature = "au3", target_vendor = "apple"))]
+mod au3_scan;
 #[cfg(feature = "vst")]
 pub mod vst;
 #[cfg(feature = "vst3")]

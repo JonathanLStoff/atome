@@ -8,11 +8,12 @@
 //! `NSExtension`, not as a `.component` dylib, and the host talks to it over
 //! XPC. That changes discovery entirely — which is why this is a separate
 //! feature with its own scanner,
-//! [`truce-rack-au3`](https://docs.rs/truce-rack-au3/1.1.5).
+//! [`truce-rack-au3`](https://docs.rs/truce-rack-au3/1.1.5) 1.1.5, carried in-tree
+//! as `au3_scan` for the reason in [`au`](super::au).
 //!
 //! It changes rendering not at all. Once an `AudioComponentInstance` is in
 //! hand the interface is the v2 one, so a loaded v3 plugin is the same
-//! [`AuPlugin`](truce_rack_au::AuPlugin) a v2 load produces, and both go
+//! `AuPlugin` a v2 load produces, and both go
 //! through the same [`host`](super::host) machinery.
 //!
 //! # Scanning finds more than loading can open
@@ -27,7 +28,7 @@
 
 use std::path::Path;
 
-use truce_rack_au3::Au3Scanner;
+use super::au3_scan::Au3Scanner;
 use truce_rack_core::{
     error::{Error as CoreError, Result as CoreResult},
     scanner::PluginScanner,
@@ -40,7 +41,7 @@ use super::host::Hosted;
 /// The same type [`au::Loaded`](super::au::Loaded) resolves to, for the reason
 /// in this module's own documentation: v3 differs in how it is found, not in
 /// how it renders.
-pub(crate) type Loaded = Hosted<truce_rack_au::AuPlugin>;
+pub(crate) type Loaded = Hosted<super::au_host::AuPlugin>;
 
 /// Scans `path` for v3 App Extensions and loads the first one.
 ///

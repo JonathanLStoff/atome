@@ -1,6 +1,6 @@
 [package]
 name = "atome" # Must be unique across all of crates.io
-version = "0.8.10"
+version = "0.8.11"
 edition = "2021"
 authors = ["Jonathan Stoff <JonathanLStoff@gmail.com>"]
 
@@ -83,12 +83,46 @@ symphonia-adapter-libopus = { version = "0.3.0", optional = true }
 # than merely feature-gated so that off-target builds do not have to resolve or
 # compile the objc2 bindings underneath them.
 #
-# `truce-rack-au3` scans for v3 App Extensions but hands the resulting
-# `AudioComponentInstance` back to `truce-rack-au`'s `AuPlugin` to hold, which
-# is why the `au3` feature turns on both crates.
+# The host is `truce-rack-au` / `truce-rack-au3` 1.1.5 carried in-tree
+# (`plugins::au_host`, `plugins::au3_scan`): the crates declare `objc2-app-kit`
+# for every Apple target, and AppKit does not exist on iOS, so an iOS app
+# linking them failed. These are those crates' own dependencies, with the
+# AppKit one (the Cocoa editor) moved to macOS.
 [target.'cfg(target_vendor = "apple")'.dependencies]
-truce-rack-au = { version = "1.1.5", optional = true, default-features = false }
-truce-rack-au3 = { version = "1.1.5", optional = true, default-features = false }
+objc2 = { version = "0.6", optional = true }
+block2 = { version = "0.6", optional = true }
+objc2-audio-toolbox = { version = "0.3", optional = true, features = [
+    "AudioComponent",
+    "AUComponent",
+    "AudioUnit",
+    "AudioUnitProperties",
+    "MusicDevice",
+    "objc2-core-foundation",
+    "block2",
+] }
+objc2-core-audio-types = { version = "0.3", optional = true, features = ["CoreAudioBaseTypes"] }
+objc2-core-foundation = { version = "0.3", optional = true, features = [
+    "CFBase",
+    "CFString",
+    "CFData",
+    "CFArray",
+    "CFError",
+    "CFPropertyList",
+    "CFURL",
+    "CFRunLoop",
+    "CFDate",
+] }
+objc2-foundation = { version = "0.3", optional = true, features = [
+    "NSString",
+    "NSURL",
+    "NSArray",
+    "NSGeometry",
+] }
+
+# The AU Cocoa editor: AppKit, so macOS alone.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3", optional = true, features = ["NSView", "NSResponder"] }
+objc2-audio-toolbox = { version = "0.3", optional = true, features = ["AUCocoaUIView"] }
 
 # The operating system's AAC decoder on Windows: Media Foundation. Apple's
 # AudioToolbox and Android's MediaCodec are system frameworks declared by hand.
@@ -128,13 +162,33 @@ vst = []
 # Steinberg VST 3 plugin hosting, via `truce-rack-vst3`.
 vst3 = ["dep:truce-rack-vst3", "dep:truce-rack-core"]
 
-# Apple Audio Unit v2 hosting, via `truce-rack-au`. macOS/iOS only — on any
-# other target the dependency is not declared and the module is not compiled.
-au = ["dep:truce-rack-au", "dep:truce-rack-core"]
+# Apple Audio Unit v2 hosting, through the in-tree copy of `truce-rack-au`
+# (`plugins::au_host`). macOS/iOS only — on any other target the dependencies
+# are not declared and the module is not compiled. The editor is macOS's alone.
+au = [
+    "dep:truce-rack-core",
+    "dep:objc2",
+    "dep:block2",
+    "dep:objc2-audio-toolbox",
+    "dep:objc2-core-audio-types",
+    "dep:objc2-core-foundation",
+    "dep:objc2-foundation",
+    "dep:objc2-app-kit",
+]
 
-# Apple Audio Unit v3 (App Extension) hosting, via `truce-rack-au3`. Scanning
-# is v3's own; the loaded instance is `truce-rack-au`'s `AuPlugin`, hence both.
-au3 = ["dep:truce-rack-au3", "dep:truce-rack-au", "dep:truce-rack-core"]
+# Apple Audio Unit v3 (App Extension) hosting. Scanning is v3's own
+# (`plugins::au3_scan`); the loaded instance is the same `AuPlugin` a v2 load
+# makes, hence the same dependencies.
+au3 = [
+    "dep:truce-rack-core",
+    "dep:objc2",
+    "dep:block2",
+    "dep:objc2-audio-toolbox",
+    "dep:objc2-core-audio-types",
+    "dep:objc2-core-foundation",
+    "dep:objc2-foundation",
+    "dep:objc2-app-kit",
+]
 
 # Convenience: every plugin format at once.
 plugins = ["vst", "vst3", "au", "au3"]

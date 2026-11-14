@@ -6,8 +6,10 @@
 //! [`PluginFormat::Au`](super::PluginFormat::Au) a format that
 //! [`Plugin::load`](super::Plugin::load) refuses, with a message saying why.
 //!
-//! Backed by [`truce-rack-au`](https://docs.rs/truce-rack-au/1.1.5). Everything
-//! atome adds on top — activation, deinterleaving, block splitting — is shared
+//! Backed by [`truce-rack-au`](https://docs.rs/truce-rack-au/1.1.5) 1.1.5, carried
+//! in-tree as `au_host` so that its Cocoa editor (AppKit) is built for macOS
+//! only: an iOS app could not link the crate. On iOS a plugin has no editor.
+//! Everything atome adds on top — activation, deinterleaving, block splitting — is shared
 //! with the other hosted formats and lives in [`host`](super::host).
 //!
 //! A v2 Audio Unit is a `.component` bundle under
@@ -16,7 +18,7 @@
 
 use std::path::Path;
 
-use truce_rack_au::{AuPlugin, AuScanner};
+use super::au_host::{AuPlugin, AuScanner};
 use truce_rack_core::{
     error::{Error as CoreError, Result as CoreResult},
     scanner::PluginScanner,
