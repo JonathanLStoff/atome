@@ -2704,10 +2704,10 @@ mod tests {
 
     #[test]
     fn create_refuses_a_kind_it_does_not_have() {
-        let error = create("phaser", 48_000, &Params::new()).expect_err("no phaser yet");
+        let error = create("theremin", 48_000, &Params::new()).expect_err("no theremin");
 
         let message = error.to_string();
-        assert!(message.contains("phaser"), "{message}");
+        assert!(message.contains("theremin"), "{message}");
         // The list of what there is, so the fix is visible.
         assert!(message.contains("chorus"), "{message}");
     }
