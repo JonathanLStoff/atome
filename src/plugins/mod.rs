@@ -93,8 +93,14 @@ mod au_host;
 mod au3_scan;
 #[cfg(feature = "vst")]
 pub mod vst;
+// Hosted plugins in a helper process (crash isolation). Needs the editor types, so any host format.
+#[cfg(any(feature = "vst3", all(any(feature = "au", feature = "au3"), target_vendor = "apple")))]
+pub mod remote;
 #[cfg(feature = "vst3")]
 pub mod vst3;
+// `truce-rack-vst3`, carried in-tree with its fixes; see its header.
+#[cfg(feature = "vst3")]
+pub(crate) mod vst3_host;
 
 // The shared hosting machinery — only worth compiling when there is a hosted
 // format to use it.
@@ -107,6 +113,19 @@ mod host;
 pub use atome::Effect;
 pub use internal::InternalPlugin;
 pub use params::{ParamError, ParamKind, ParamSpec, Params, Value};
+
+/// A hosted plugin's own window, and the native parent it opens in.
+#[cfg(any(
+    feature = "vst3",
+    all(any(feature = "au", feature = "au3"), target_vendor = "apple")
+))]
+pub use truce_rack_core::editor::{PluginEditor, WindowHandle};
+
+#[cfg(any(
+    feature = "vst3",
+    all(any(feature = "au", feature = "au3"), target_vendor = "apple")
+))]
+pub mod scan;
 
 /// Whether a hosted format is compiled into this build.
 ///
@@ -391,6 +410,7 @@ impl Plugin {
             #[cfg(feature = "vst3")]
             PluginFormat::Vst3 => PluginInner::Vst3(vst3::load(
                 &self.path,
+                &self.name,
                 self.channels,
                 self.sample_rate as f64,
                 self.buffer_size,
@@ -674,12 +694,83 @@ impl Plugin {
     /// when a chain is reused for unrelated audio, so the last of the previous
     /// material does not ring into the new.
     ///
-    /// Only [built-ins](atome) answer this. A plugin built from a closure keeps
-    /// any state inside the closure where this cannot reach, and the hosted
-    /// formats expose no reset short of deactivating.
+    /// A [built-in](atome) clears its memory; a hosted plugin (VST3, AU) is
+    /// deactivated and activated again at the same layout, which is how those
+    /// formats clear theirs, keeping its parameters and state. Not for the audio
+    /// thread. A plugin built from a closure keeps any state inside the closure
+    /// where this cannot reach.
     pub fn reset(&mut self) {
-        if let Some(PluginInner::Internal(plugin)) = &mut self.inner {
-            plugin.reset();
+        match &mut self.inner {
+            Some(PluginInner::Internal(plugin)) => plugin.reset(),
+            #[cfg(all(feature = "au", target_vendor = "apple"))]
+            Some(PluginInner::Au(plugin)) => plugin.reset(),
+            #[cfg(all(feature = "au3", target_vendor = "apple", not(feature = "au")))]
+            Some(PluginInner::Au3(plugin)) => plugin.reset(),
+            #[cfg(feature = "vst3")]
+            Some(PluginInner::Vst3(plugin)) => plugin.reset(),
+            #[allow(unreachable_patterns)]
+            _ => {}
+        }
+    }
+
+    /// A hosted plugin's whole state, as opaque bytes for [`set_state`](Self::set_state).
+    ///
+    /// What a host saves with a project, beyond the parameters: presets,
+    /// sample paths, anything the plugin keeps. `None` for a built-in (its
+    /// [`params`](Self::params) are its state), before [`load`](Self::load),
+    /// or when the plugin refuses.
+    pub fn state(&self) -> Option<Vec<u8>> {
+        match &self.inner {
+            None | Some(PluginInner::Internal(_)) => None,
+            #[cfg(all(feature = "au", target_vendor = "apple"))]
+            Some(PluginInner::Au(plugin)) => plugin.state().ok(),
+            #[cfg(all(feature = "au3", target_vendor = "apple", not(feature = "au")))]
+            Some(PluginInner::Au3(plugin)) => plugin.state().ok(),
+            #[cfg(feature = "vst3")]
+            Some(PluginInner::Vst3(plugin)) => plugin.state().ok(),
+        }
+    }
+
+    /// Restores what [`state`](Self::state) gave. Off the audio thread.
+    ///
+    /// # Errors
+    ///
+    /// Fails before [`load`](Self::load), for a built-in, or when the plugin
+    /// rejects the bytes.
+    #[allow(unused_variables)] // with no hosted format, nothing reads it
+    pub fn set_state(&mut self, bytes: &[u8]) -> Result<(), String> {
+        match &mut self.inner {
+            None => Err("the plugin is not loaded".into()),
+            Some(PluginInner::Internal(_)) => Err("a built-in keeps its state in its parameters".into()),
+            #[cfg(all(feature = "au", target_vendor = "apple"))]
+            Some(PluginInner::Au(plugin)) => plugin.set_state(bytes).map_err(|e| e.to_string()),
+            #[cfg(all(feature = "au3", target_vendor = "apple", not(feature = "au")))]
+            Some(PluginInner::Au3(plugin)) => plugin.set_state(bytes).map_err(|e| e.to_string()),
+            #[cfg(feature = "vst3")]
+            Some(PluginInner::Vst3(plugin)) => plugin.set_state(bytes).map_err(|e| e.to_string()),
+        }
+    }
+
+    /// The plugin's own window, when it has one: open it in a parent window
+    /// with [`PluginEditor::open`].
+    ///
+    /// Main thread only, as every editor call is. The borrow is `&mut self`,
+    /// so the same instance cannot be processing audio meanwhile: keep an
+    /// editing copy for the window and hand its [`state`](Self::state) to the
+    /// one that plays. iOS AUs and built-ins have none.
+    #[cfg(any(
+        feature = "vst3",
+        all(any(feature = "au", feature = "au3"), target_vendor = "apple")
+    ))]
+    pub fn editor(&mut self) -> Option<&mut dyn PluginEditor> {
+        match &mut self.inner {
+            None | Some(PluginInner::Internal(_)) => None,
+            #[cfg(all(feature = "au", target_vendor = "apple"))]
+            Some(PluginInner::Au(plugin)) => plugin.editor(),
+            #[cfg(all(feature = "au3", target_vendor = "apple", not(feature = "au")))]
+            Some(PluginInner::Au3(plugin)) => plugin.editor(),
+            #[cfg(feature = "vst3")]
+            Some(PluginInner::Vst3(plugin)) => plugin.editor(),
         }
     }
 }

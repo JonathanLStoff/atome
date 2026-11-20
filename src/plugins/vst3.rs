@@ -30,7 +30,7 @@ use truce_rack_core::{
     error::{Error as CoreError, Result as CoreResult},
     scanner::PluginScanner,
 };
-use truce_rack_vst3::{Vst3Plugin, Vst3Scanner};
+use super::vst3_host::{scan_bundle, Vst3Plugin, Vst3Scanner};
 
 use super::host::Hosted;
 
@@ -51,16 +51,21 @@ pub(crate) type Loaded = Hosted<Vst3Plugin>;
 /// if the plugin declares no `channels`-in/`channels`-out layout.
 pub(crate) fn load(
     path: &Path,
+    name: &str,
     channels: usize,
     sample_rate: f64,
     max_block: usize,
 ) -> CoreResult<Loaded> {
     let scanner = Vst3Scanner::new();
 
-    let info = scanner
-        .scan_path(path)?
-        .into_iter()
-        .next()
+    // A bundle can hold several plugins: the one named `name`, else the first.
+    // A bundle (`.vst3`, a file on Windows and a folder elsewhere) is opened itself; any other
+    // path is a folder of bundles.
+    let is_bundle = path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("vst3"));
+    let mut found = if is_bundle { scan_bundle(path)? } else { scanner.scan_path(path)? };
+    let at = found.iter().position(|info| info.name == name).unwrap_or(0);
+    let info = (at < found.len())
+        .then(|| found.swap_remove(at))
         .ok_or_else(|| CoreError::PluginNotFound(path.display().to_string()))?;
 
     Hosted::new(scanner.load(&info)?, channels, sample_rate, max_block)

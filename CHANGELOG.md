@@ -8,6 +8,48 @@ underneath it, so **Done** always holds exactly what is unreleased.
 
 **Done**
 
+## Release 0.8.12
+
+- **Plugin windows and state.** `Plugin::editor()` hands out a hosted
+  plugin's own window (`PluginEditor`, re-exported with `WindowHandle`) to
+  open in a native parent, main thread only. `Plugin::state()` /
+  `set_state()` save and restore a hosted plugin's whole state as opaque
+  bytes, for a host to keep with a project.
+- **`plugins::scan`.** `scan::vst3(folders)` and `scan::au()` list installed
+  plugins as `Found { name, vendor, format, id, path, kind, instrument }`,
+  with `Failed { path, reason }` for bundles that would not read, and
+  `Found::plugin()` builds the descriptor. A VST3's vendor and kind come from
+  its `moduleinfo.json` sub-categories without loading it; otherwise the kind
+  is guessed from the name (`kind_from_name`), one of `scan::KINDS`.
+  `default_vst3_folders()` gives the OS's usual folders. `vst3` now pulls in
+  `serde_json`.
+- **AU loads by id.** An AU lives in the registry, so the descriptor's `path`
+  is now its `type:sub:mfr` id (as `Found::id` gives it); before, every AU
+  load scanned a path and failed.
+- **VST3 picks the class by name** in a bundle that holds several, the first
+  one otherwise.
+- **VST3 host carried in-tree** (`plugins::vst3_host`, from `truce-rack-vst3`
+  1.1.5, kept for good). Three fixes: a dropped VST3 no longer crashes (the
+  library was unloaded before the plugin's COM objects were released); Windows
+  calls `InitDll` / `ExitDll`, which Native Instruments and other plugins need;
+  and a bundle path loads (`scan_bundle`), where before only a folder of bundles
+  did, so `Plugin::load` and `scan::vst3` found nothing for a `.vst3` path or a
+  bundle without `moduleinfo.json`. `vst3` now depends on `vst3` and
+  `libloading` directly instead of `truce-rack-vst3`.
+- **`plugins::remote`: a hosted plugin in a helper process**, so one that
+  crashes takes down only its helper. `Remote::spawn` starts a program that
+  calls `remote::host_main` (a host relaunches itself with an argument) and
+  loads the plugin there; `process`, `reset`, `state` / `set_state`,
+  `latency` and `open_editor` / `close_editor` (the window in the host's
+  parent window; the helper pumps Windows messages) go over its standard input
+  and output, about 80 µs a 1024-frame block. A dead helper fails every call
+  and reports `is_dead`.
+- **`Plugin::reset` reaches hosted plugins:** a VST3 or AU is deactivated and
+  activated again at the same layout, clearing its tails between uses.
+- **Three built-ins:** `polarity` (invert per side), `phaser` (swept all-pass
+  notches with feedback) and `de_esser` (high-pass keyed compression,
+  split-band or wideband).
+
 ## Release 0.8.11
 
 - **AU hosting links on iOS.** `au` and `au3` pulled in `truce-rack-au` 1.1.5,

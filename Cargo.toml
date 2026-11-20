@@ -1,6 +1,6 @@
 [package]
 name = "atome" # Must be unique across all of crates.io
-version = "0.8.11"
+version = "0.8.12"
 edition = "2021"
 authors = ["Jonathan Stoff <JonathanLStoff@gmail.com>"]
 
@@ -34,8 +34,12 @@ ringbuf = "0.5.1"
 # stays available in a build with no plugin feature on at all.
 truce-rack-core = { version = "1.1.5", optional = true, default-features = false }
 
-# VST3 hosting. All platforms.
-truce-rack-vst3 = { version = "1.1.5", optional = true, default-features = false }
+# VST3 hosting, all platforms: `truce-rack-vst3` 1.1.5 is carried in-tree as
+# `plugins::vst3_host` (with its fixes), so these are its own dependencies.
+vst3 = { version = "0.3", optional = true }
+libloading = { version = "0.8", optional = true }
+# Reads a VST3 bundle's `moduleinfo.json` (vendor, sub-categories) without loading it.
+serde_json = { version = "1", optional = true }
 
 # AU v2 and v3 are Apple frameworks. Their crates are declared further down,
 # under `[target.'cfg(target_vendor = "apple")'.dependencies]`, so a Linux or
@@ -121,6 +125,9 @@ objc2-foundation = { version = "0.3", optional = true, features = [
 
 # The AU Cocoa editor: AppKit, so macOS alone.
 [target.'cfg(target_os = "macos")'.dependencies]
+# The VST3 host's bundle loading (`plugins::vst3_host`), macOS alone.
+core-foundation = { version = "0.10", optional = true }
+core-foundation-sys = { version = "0.8", optional = true }
 objc2-app-kit = { version = "0.3", optional = true, features = ["NSView", "NSResponder"] }
 objc2-audio-toolbox = { version = "0.3", optional = true, features = ["AUCocoaUIView"] }
 
@@ -160,7 +167,7 @@ asio = ["cpal/asio"]
 vst = []
 
 # Steinberg VST 3 plugin hosting, via `truce-rack-vst3`.
-vst3 = ["dep:truce-rack-vst3", "dep:truce-rack-core"]
+vst3 = ["dep:vst3", "dep:libloading", "dep:truce-rack-core", "dep:serde_json", "dep:core-foundation", "dep:core-foundation-sys"]
 
 # Apple Audio Unit v2 hosting, through the in-tree copy of `truce-rack-au`
 # (`plugins::au_host`). macOS/iOS only — on any other target the dependencies

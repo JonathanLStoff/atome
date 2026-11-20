@@ -57,12 +57,14 @@ pub(crate) fn load(
     max_block: usize,
 ) -> CoreResult<Loaded> {
     let scanner = Au3Scanner::new();
-
+    // An AU lives in a registry, not a folder: `path` is its `type:sub:mfr`
+    // id (as `scan::Found::id` gives it), or an empty path for the first one.
+    let id = path.to_string_lossy();
     let info = scanner
-        .scan_path(path)?
+        .scan()?
         .into_iter()
-        .next()
-        .ok_or_else(|| CoreError::PluginNotFound(path.display().to_string()))?;
+        .find(|info| id.is_empty() || info.unique_id == id)
+        .ok_or_else(|| CoreError::PluginNotFound(id.to_string()))?;
 
     Hosted::new(scanner.load(&info)?, channels, sample_rate, max_block)
 }

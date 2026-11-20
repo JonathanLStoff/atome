@@ -48,6 +48,9 @@
 //! | [`chorus`] | modulated short delay, mixed in |
 //! | [`flanger`] | as chorus, shorter and with feedback |
 //! | [`reverb`] | Schroeder comb/all-pass reverb |
+//! | [`polarity`] | polarity invert, per side |
+//! | [`phaser`] | swept all-pass notches |
+//! | [`de_esser`] | compression keyed on the highs |
 //!
 //! [`kinds`] lists them at runtime and [`schema`] describes any one's
 //! parameters, so a host can build a menu without knowing this table.
@@ -1751,6 +1754,245 @@ impl Effect for ReverbEffect {
 }
 
 // -----------------------------------------------------------------------------
+//  Polarity
+// -----------------------------------------------------------------------------
+
+parameters! {
+    /// [`polarity`]'s parameters.
+    PolarityParams {
+        @toggle left: true, "flip the left channel (every even channel; a mono signal's only one)";
+        @toggle right: true, "flip the right channel (every odd channel)";
+    }
+}
+
+/// Polarity (phase) invert, per side.
+pub struct PolarityEffect {
+    params: PolarityParams,
+    sample_rate: u32,
+}
+
+impl PolarityEffect {
+    pub fn new(sample_rate: u32) -> Self {
+        Self {
+            params: PolarityParams::default(),
+            sample_rate,
+        }
+    }
+
+    fn configured(mut self, params: PolarityParams) -> Self {
+        self.params = params;
+        self
+    }
+}
+
+impl Effect for PolarityEffect {
+    effect_common!(PolarityParams);
+
+    fn process(&mut self, buffer: &mut [f32], channels: u16) {
+        let channels = channels as usize;
+        if channels == 0 {
+            return;
+        }
+        let flip = [self.params.left, self.params.right];
+        for frame in buffer.chunks_mut(channels) {
+            for (channel, sample) in frame.iter_mut().enumerate() {
+                if flip[channel % 2] {
+                    *sample = -*sample;
+                }
+            }
+        }
+    }
+
+    fn reset(&mut self) {}
+}
+
+// -----------------------------------------------------------------------------
+//  Phaser
+// -----------------------------------------------------------------------------
+
+parameters! {
+    /// [`phaser`]'s parameters.
+    PhaserParams {
+        rate_hz: 0.5, 0.05, 10.0, "Hz", "sweeps per second";
+        depth: 0.7, 0.0, 1.0, "", "how far the notches sweep: 1 is two octaves each way";
+        centre_hz: 800.0, 100.0, 5000.0, "Hz", "where the sweep is centred";
+        feedback: 0.5, 0.0, 0.9, "", "how much of the output is fed back in: sharper notches";
+        stages: 6.0, 2.0, 12.0, "", "all-pass stages, rounded down to even: two per notch";
+        mix: 0.5, 0.0, 1.0, "", "0 is dry, 0.5 the classic notches, 1 the shifted signal only";
+    }
+}
+
+const MAX_STAGES: usize = 12;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PhaserChannel {
+    stages: [f32; MAX_STAGES],
+    last: f32,
+}
+
+/// First-order all-passes swept by one LFO, mixed back with the dry signal.
+///
+/// The LFO advances per frame, so every channel sweeps together.
+pub struct PhaserEffect {
+    params: PhaserParams,
+    channels: PerChannel<PhaserChannel>,
+    phase: f32,
+    sample_rate: u32,
+}
+
+impl PhaserEffect {
+    pub fn new(sample_rate: u32) -> Self {
+        Self {
+            params: PhaserParams::default(),
+            channels: PerChannel::new(),
+            phase: 0.0,
+            sample_rate,
+        }
+    }
+
+    fn configured(mut self, params: PhaserParams) -> Self {
+        self.params = params;
+        self
+    }
+}
+
+impl Effect for PhaserEffect {
+    effect_common!(PhaserParams);
+
+    fn process(&mut self, buffer: &mut [f32], channels: u16) {
+        let channels = channels as usize;
+        if channels == 0 {
+            return;
+        }
+
+        let rate = self.sample_rate as f32;
+        let PhaserParams { rate_hz, depth, centre_hz, feedback, stages, mix } = self.params;
+        let stages = ((stages as usize) & !1).clamp(2, MAX_STAGES);
+        let step = rate_hz / rate;
+        let states = self.channels.get(channels);
+
+        for frame in buffer.chunks_mut(channels) {
+            let lfo = (self.phase * TAU).sin();
+            let frequency = (centre_hz * 2.0_f32.powf(2.0 * depth * lfo)).clamp(20.0, rate * 0.45);
+            let t = (std::f32::consts::PI * frequency / rate).tan();
+            let a = (t - 1.0) / (t + 1.0);
+
+            for (sample, state) in frame.iter_mut().zip(states.iter_mut()) {
+                let mut x = *sample + state.last * feedback;
+                for z in &mut state.stages[..stages] {
+                    let y = a * x + *z;
+                    *z = x - a * y;
+                    x = y;
+                }
+                state.last = x;
+                *sample = *sample * (1.0 - mix) + x * mix;
+            }
+            self.phase = (self.phase + step).fract();
+        }
+    }
+
+    fn reset(&mut self) {
+        self.channels.clear();
+        self.phase = 0.0;
+    }
+}
+
+// -----------------------------------------------------------------------------
+//  De-esser
+// -----------------------------------------------------------------------------
+
+parameters! {
+    /// [`de_esser`]'s parameters.
+    DeEsserParams {
+        threshold_db: -30.0, -60.0, 0.0, "dB", "sibilance above this is turned down";
+        frequency_hz: 6000.0, 2000.0, 12000.0, "Hz", "sibilance is listened for above this";
+        range_db: 12.0, 0.0, 24.0, "dB", "the most it turns down";
+        @toggle wideband: false, "turn the whole signal down, not just the highs";
+    }
+}
+
+/// Compression keyed on the highs: a high-pass detector, 4:1 above the
+/// threshold, a fixed 1 ms attack and 60 ms release.
+///
+/// Split-band by default: only the high-passed part is turned down, so the
+/// voice under the "s" keeps its level. Past eight channels the rest are
+/// turned down whole.
+pub struct DeEsserEffect {
+    params: DeEsserParams,
+    filters: PerChannel<Biquad>,
+    /// Reduction applied, in dB. Negative or zero.
+    reduction_db: f32,
+    sample_rate: u32,
+}
+
+impl DeEsserEffect {
+    pub fn new(sample_rate: u32) -> Self {
+        Self {
+            params: DeEsserParams::default(),
+            filters: PerChannel::new(),
+            reduction_db: 0.0,
+            sample_rate,
+        }
+    }
+
+    fn configured(mut self, params: DeEsserParams) -> Self {
+        self.params = params;
+        self
+    }
+}
+
+impl Effect for DeEsserEffect {
+    effect_common!(DeEsserParams);
+
+    fn process(&mut self, buffer: &mut [f32], channels: u16) {
+        let channels = channels as usize;
+        if channels == 0 {
+            return;
+        }
+
+        let rate = self.sample_rate as f32;
+        let attack = time_coefficient(1.0, rate);
+        let release = time_coefficient(60.0, rate);
+        let DeEsserParams { threshold_db, frequency_hz, range_db, wideband } = self.params;
+        let filters = self.filters.get(channels);
+        for filter in filters.iter_mut() {
+            filter.high_pass(frequency_hz, std::f32::consts::FRAC_1_SQRT_2, rate);
+        }
+
+        for frame in buffer.chunks_mut(channels) {
+            let mut highs = [0.0_f32; 8];
+            let mut peak = 0.0_f32;
+            for (channel, (sample, filter)) in frame.iter().zip(filters.iter_mut()).enumerate() {
+                let high = filter.process(*sample);
+                peak = peak.max(high.abs());
+                if channel < highs.len() {
+                    highs[channel] = high;
+                }
+            }
+
+            let over = to_db(peak) - threshold_db;
+            let wanted = if over > 0.0 { (-over * 0.75).max(-range_db) } else { 0.0 };
+            let coefficient = if wanted < self.reduction_db { attack } else { release };
+            self.reduction_db += coefficient * (wanted - self.reduction_db);
+            let gain = from_db(self.reduction_db);
+
+            for (channel, sample) in frame.iter_mut().enumerate() {
+                if wideband || channel >= highs.len() {
+                    *sample *= gain;
+                } else {
+                    *sample -= highs[channel] * (1.0 - gain);
+                }
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        self.filters.clear();
+        self.reduction_db = 0.0;
+    }
+}
+
+// -----------------------------------------------------------------------------
 //  Constructors
 // -----------------------------------------------------------------------------
 
@@ -1839,6 +2081,12 @@ constructors! {
     flanger => "flanger", FlangerEffect;
     /// Eight comb filters into four all-passes, per channel.
     reverb => "reverb", ReverbEffect;
+    /// Polarity invert, per side.
+    polarity => "polarity", PolarityEffect;
+    /// Swept all-pass notches.
+    phaser => "phaser", PhaserEffect;
+    /// Compression keyed on the highs.
+    de_esser => "de_esser", DeEsserEffect;
 }
 
 #[cfg(test)]

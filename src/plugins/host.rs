@@ -99,6 +99,36 @@ where
     }
 
     // -------------------------------------------------------------------------
+    //  State and editor
+    // -------------------------------------------------------------------------
+
+    /// Clears what the plugin carries from block to block (its tails, delay
+    /// lines) by deactivating it and activating it again at the same layout.
+    pub(crate) fn reset(&mut self) {
+        self.plugin.deactivate();
+        if let Some(layout) = layout_for(self.plugin.supported_layouts(), self.channels) {
+            if let Err(error) = self.plugin.activate(layout, self.sample_rate, self.max_block) {
+                eprintln!("[atome] could not reactivate {}: {error}", self.plugin.info().name);
+            }
+        }
+    }
+
+    /// The plugin's whole state, opaque bytes only it reads back.
+    pub(crate) fn state(&self) -> CoreResult<Vec<u8>> {
+        self.plugin.save_state()
+    }
+
+    /// Restores bytes [`state`](Self::state) gave.
+    pub(crate) fn set_state(&mut self, bytes: &[u8]) -> CoreResult<()> {
+        self.plugin.load_state(bytes)
+    }
+
+    /// The plugin's own window, when it has one. Main thread only.
+    pub(crate) fn editor(&mut self) -> Option<&mut dyn truce_rack_core::editor::PluginEditor> {
+        self.plugin.editor()
+    }
+
+    // -------------------------------------------------------------------------
     //  Parameters
     // -------------------------------------------------------------------------
 
