@@ -8,6 +8,14 @@ underneath it, so **Done** always holds exactly what is unreleased.
 
 **Done**
 
+## Release 0.8.14
+
+- **An effect on a whole output.** `OutputClass::set_master_effect(Some(plugin))`
+  (or `MixerHandle::set_master(plugin, channels)`) runs one effect on
+  everything the output plays, as the mixer commits it, in the output's own
+  sample type: a limiter to protect the speakers. `None` takes it off; heard
+  from the next buffer. While one is set the mixer commits whole frames only.
+
 ## Release 0.8.13
 
 - **Reverb quality.** `reverb` takes `quality` (default 1): under 0.5 it runs
