@@ -213,6 +213,9 @@ pub struct Mixer<S: SampleType> {
     gains: HashMap<u64, Ramp>,
     /// Passes run so far ([`MixerHandle::passes`]).
     passes: Arc<AtomicU64>,
+    /// An effect run on everything the output plays, as it is committed
+    /// ([`MixerHandle::set_master`]), with the output's channel count.
+    master: Arc<Mutex<Option<(crate::plugins::Plugin, u16)>>>,
 }
 
 impl<S: SampleType> Mixer<S> {
@@ -230,6 +233,7 @@ impl<S: SampleType> Mixer<S> {
             cancels: Arc::new(Voices::default()),
             gains: HashMap::new(),
             passes: Arc::new(AtomicU64::new(0)),
+            master: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -388,7 +392,14 @@ impl<S: SampleType> Mixer<S> {
     /// scheduled off the clock would land however long the output had been
     /// quiet in the future — late, or past [`MAX_SCHEDULE_AHEAD`] and dropped.
     fn flush(&mut self) -> usize {
-        let ready = self.output.vacant_len();
+        let slot = Arc::clone(&self.master);
+        let mut master = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut ready = self.output.vacant_len();
+        // An output effect takes whole frames: what does not fill one waits a pass.
+        if let Some((_, channels)) = master.as_ref() {
+            let channels = usize::from((*channels).max(1));
+            ready -= ready % channels;
+        }
         if ready == 0 {
             return 0;
         }
@@ -397,6 +408,12 @@ impl<S: SampleType> Mixer<S> {
         }
 
         self.commit_voices(ready);
+
+        if let Some((plugin, channels)) = master.as_mut() {
+            // A failing output effect lets the sound through as it is, never silence.
+            let _ = plugin.apply(&mut self.mix[..ready], *channels);
+        }
+        drop(master);
 
         let pushed = self.output.push_slice(&self.mix[..ready]);
         self.mix.drain(..pushed);
@@ -448,6 +465,11 @@ impl<S: SampleType> Mixer<S> {
         }
     }
 
+    /// Where the output effect is kept ([`MixerHandle::set_master`]).
+    pub fn master(&self) -> Arc<Mutex<Option<(crate::plugins::Plugin, u16)>>> {
+        Arc::clone(&self.master)
+    }
+
     /// How many passes this mixer has run, counted as it runs: one that stops
     /// rising has stopped mixing, though the stream keeps padding with silence.
     pub fn passes(&self) -> Arc<AtomicU64> {
@@ -476,6 +498,7 @@ pub struct MixerHandle {
     clear: Arc<ClearSignal>,
     voices: Arc<Voices>,
     passes: Arc<AtomicU64>,
+    master: Arc<Mutex<Option<(crate::plugins::Plugin, u16)>>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -487,6 +510,7 @@ impl MixerHandle {
         let clear = mixer.clear_signal();
         let voices = mixer.voices();
         let passes = mixer.passes();
+        let master = mixer.master();
 
         let thread = thread::Builder::new()
             .name("atome_mixer".to_string())
@@ -498,8 +522,16 @@ impl MixerHandle {
             clear,
             voices,
             passes,
+            master,
             thread: Some(thread),
         }
+    }
+
+    /// Runs `effect` on everything this output plays, as the mixer commits it,
+    /// `channels` wide (the output's): a limiter to protect the speakers, say.
+    /// `None` takes it off. Heard from the next buffer.
+    pub fn set_master(&self, effect: Option<crate::plugins::Plugin>, channels: u16) {
+        *self.master.lock().unwrap_or_else(PoisonError::into_inner) = effect.map(|effect| (effect, channels));
     }
 
     /// Whether the mixer thread is still running. A thread that panicked or

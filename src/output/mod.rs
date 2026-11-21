@@ -476,6 +476,12 @@ impl<S: SampleType> OutputClass<S> {
     pub fn mixer(&self) -> &MixerHandle {
         &self.mixer
     }
+
+    /// Runs `effect` on everything this output plays (see
+    /// [`MixerHandle::set_master`]); `None` takes it off.
+    pub fn set_master_effect(&self, effect: Option<crate::plugins::Plugin>) {
+        self.mixer.set_master(effect, self.channels);
+    }
     /// Aligns the samples to the output's sample rate and channel count.
     ///
     /// Set `interleaved` to describe what you are handing in: `true` for frames
