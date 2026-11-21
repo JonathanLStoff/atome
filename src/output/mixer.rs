@@ -144,12 +144,98 @@ impl Ramp {
     }
 }
 
+/// "Weigh each channel of this voice, or bus, by these levels, over this long":
+/// a pan, done in the mixer so it is heard within a buffer.
+///
+/// `levels` has one linear level per output channel; a channel past its end
+/// stays at `1.0`. It multiplies the voice's [`GainChange`] level.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LevelsChange {
+    pub voice: u64,
+    pub levels: Vec<f32>,
+    /// The ramp's length in interleaved samples; `0` is at once.
+    pub samples: usize,
+    pub channels: usize,
+}
+
+/// A voice's per-channel levels: where they are going, and how far along.
+#[derive(Clone, Debug)]
+struct Weights {
+    from: Vec<f32>,
+    to: Vec<f32>,
+    start: usize,
+    len: usize,
+    channels: usize,
+    seen: usize,
+}
+
+impl Weights {
+    fn level(levels: &[f32], channel: usize) -> f32 {
+        levels.get(channel).copied().unwrap_or(1.0)
+    }
+
+    /// The level at absolute interleaved index `at`, for the channel it is on.
+    fn at(&self, at: usize) -> f32 {
+        let channels = self.channels.max(1);
+        let channel = at % channels;
+        let to = Self::level(&self.to, channel);
+        if at >= self.start + self.len {
+            return to;
+        }
+        let from = Self::level(&self.from, channel);
+        if at <= self.start {
+            return from;
+        }
+        let frames = (self.len / channels).max(1);
+        let frame = (at - self.start) / channels;
+        from + (to - from) * (frame as f32 / frames as f32)
+    }
+
+    /// Every channel's level now, to start a new ramp from.
+    fn now(&self, at: usize) -> Vec<f32> {
+        let channels = self.channels.max(1);
+        let frame = at - at % channels;
+        (0..channels).map(|channel| self.at(frame + channel)).collect()
+    }
+
+    fn unity(&self, cursor: usize) -> bool {
+        cursor >= self.start + self.len && self.to.iter().all(|level| *level == 1.0)
+    }
+}
+
+/// A submix: the voices sent to it are summed apart, run through its effects,
+/// brought to its own level and pan (a [`GainChange`] and [`LevelsChange`] on
+/// its id, as for a voice), and then summed into the output.
+#[derive(Debug)]
+struct Bus<S: SampleType> {
+    effects: Vec<crate::plugins::Plugin>,
+    channels: u16,
+    buffer: Vec<S>,
+    /// A voice summed into `buffer` this pass.
+    fed: bool,
+}
+
+impl<S: SampleType> Bus<S> {
+    fn new(channels: u16) -> Self {
+        Bus { effects: Vec::new(), channels, buffer: Vec::new(), fed: false }
+    }
+}
+
 /// Voices to take back or to change the level of, shared between whoever
 /// schedules and the mixer.
 #[derive(Debug, Default)]
 pub struct Voices {
     cancelled: Mutex<Vec<u64>>,
     gains: Mutex<Vec<GainChange>>,
+    levels: Mutex<Vec<LevelsChange>>,
+    /// A voice sent to a bus, or (`None`) back to the output.
+    sends: Mutex<Vec<(u64, Option<u64>)>>,
+    /// A bus's effects, and the channel count they run at.
+    effects: Mutex<Vec<(u64, Vec<crate::plugins::Plugin>, u16)>>,
+}
+
+fn take_all<T>(list: &Mutex<Vec<T>>) -> Vec<T> {
+    std::mem::take(&mut *list.lock().unwrap_or_else(PoisonError::into_inner))
 }
 
 impl Voices {
@@ -177,6 +263,25 @@ impl Voices {
 
     fn take_gains(&self) -> Vec<GainChange> {
         std::mem::take(&mut *self.gains.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Weighs a voice's (or bus's) channels: a pan. Heard one buffer later.
+    pub fn levels(&self, change: LevelsChange) {
+        self.levels.lock().unwrap_or_else(PoisonError::into_inner).push(change);
+    }
+
+    /// Sends `voice` through `bus` (made on first use), or with `None` straight
+    /// to the output again. Send before scheduling: samples already committed
+    /// were mixed where the voice went then.
+    pub fn send(&self, voice: u64, bus: Option<u64>) {
+        self.sends.lock().unwrap_or_else(PoisonError::into_inner).push((voice, bus));
+    }
+
+    /// Sets `bus`'s effects, run in order on its sum, `channels` wide (the
+    /// output's). An empty list takes them off. [`cancel`](Self::cancel) on a
+    /// bus's id removes the bus; its voices go straight to the output.
+    pub fn bus_effects(&self, bus: u64, effects: Vec<crate::plugins::Plugin>, channels: u16) {
+        self.effects.lock().unwrap_or_else(PoisonError::into_inner).push((bus, effects, channels));
     }
 }
 
@@ -216,6 +321,12 @@ pub struct Mixer<S: SampleType> {
     /// An effect run on everything the output plays, as it is committed
     /// ([`MixerHandle::set_master`]), with the output's channel count.
     master: Arc<Mutex<Option<(crate::plugins::Plugin, u16)>>>,
+    /// Per-channel levels (pans) of voices and buses, by id.
+    weights: HashMap<u64, Weights>,
+    /// The bus each voice that has one is sent through, and the cursor when it
+    /// last had samples waiting.
+    sends: HashMap<u64, (u64, usize)>,
+    buses: HashMap<u64, Bus<S>>,
 }
 
 impl<S: SampleType> Mixer<S> {
@@ -234,6 +345,9 @@ impl<S: SampleType> Mixer<S> {
             gains: HashMap::new(),
             passes: Arc::new(AtomicU64::new(0)),
             master: Arc::new(Mutex::new(None)),
+            weights: HashMap::new(),
+            sends: HashMap::new(),
+            buses: HashMap::new(),
         }
     }
 
@@ -256,7 +370,20 @@ impl<S: SampleType> Mixer<S> {
         self.commands.clear();
         self.mix.clear();
         self.voices.clear();
-        self.gains.clear();
+        self.sends.clear();
+        // A bus's level and pan are its settings, not something scheduled.
+        // shortcut: a bus effect's tail (a reverb) still rings out after a stop; reset effects if that is heard.
+        let buses = &self.buses;
+        self.gains.retain(|id, _| buses.contains_key(id));
+        self.weights.retain(|id, _| buses.contains_key(id));
+    }
+
+    /// Starts a voice's channels towards new levels from wherever they are.
+    fn apply_levels(&mut self, change: LevelsChange) {
+        let channels = change.channels.max(1);
+        let from = self.weights.get(&change.voice).map_or_else(|| vec![1.0; channels], |weights| weights.now(self.cursor));
+        let to = change.levels.iter().map(|level| if level.is_finite() { level.max(0.0) } else { 1.0 }).collect();
+        self.weights.insert(change.voice, Weights { from, to, start: self.cursor, len: change.samples, channels, seen: self.cursor });
     }
 
     /// Starts a voice towards a new level from wherever it is now.
@@ -319,42 +446,93 @@ impl<S: SampleType> Mixer<S> {
     }
 
     /// Sums the voiced samples that fall in the next `ready` samples into
-    /// `mix`, and forgets the segments that are now wholly committed.
+    /// `mix` (through their bus, if they have one), and forgets the segments
+    /// that are now wholly committed.
     fn commit_voices(&mut self, ready: usize) {
         let (from, to) = (self.cursor, self.cursor + ready);
+        for bus in self.buses.values_mut() {
+            bus.buffer.clear();
+            bus.buffer.resize(ready, S::SILENCE);
+            bus.fed = false;
+        }
 
         for (voice, segments) in self.voices.iter_mut() {
             let ramp = self.gains.get_mut(voice);
             // A voice at a steady level of one needs no arithmetic at all.
             let level = ramp.as_deref().copied();
+            let weights = self.weights.get_mut(voice);
+            let send = self.sends.get_mut(voice);
+            let into: &mut [S] = match send.as_ref().and_then(|(bus, _)| self.buses.get_mut(bus)) {
+                Some(bus) => {
+                    bus.fed = true;
+                    &mut bus.buffer
+                }
+                None => &mut self.mix[..ready],
+            };
 
             for (index, samples) in segments.iter() {
                 let (start, end) = (*index, index + samples.len());
                 let (low, high) = (start.max(from), end.min(to));
 
-                match level {
-                    None => {
-                        for absolute in low..high {
-                            let slot = &mut self.mix[absolute - from];
-                            *slot = slot.mix(samples[absolute - start]);
-                        }
+                if level.is_none() && weights.is_none() {
+                    for absolute in low..high {
+                        let slot = &mut into[absolute - from];
+                        *slot = slot.mix(samples[absolute - start]);
                     }
-                    Some(ramp) => {
-                        for absolute in low..high {
-                            let gain = ramp.at(absolute);
-                            let sample = samples[absolute - start];
-                            // The float round-trip only where the level is not one.
-                            let sample = if gain == 1.0 { sample } else { S::from_f32(sample.to_f32() * gain) };
-                            let slot = &mut self.mix[absolute - from];
-                            *slot = slot.mix(sample);
-                        }
+                    continue;
+                }
+                for absolute in low..high {
+                    let mut gain = level.map_or(1.0, |ramp| ramp.at(absolute));
+                    if let Some(weights) = weights.as_deref() {
+                        gain *= weights.at(absolute);
                     }
+                    let sample = samples[absolute - start];
+                    // The float round-trip only where the level is not one.
+                    let sample = if gain == 1.0 { sample } else { S::from_f32(sample.to_f32() * gain) };
+                    let slot = &mut into[absolute - from];
+                    *slot = slot.mix(sample);
                 }
             }
 
             segments.retain(|(index, samples)| index + samples.len() > to);
             if let Some(ramp) = ramp {
                 ramp.seen = to;
+            }
+            if let Some(weights) = weights {
+                weights.seen = to;
+            }
+            if let Some(send) = send {
+                send.1 = to;
+            }
+        }
+
+        // Each bus: its effects on its sum (every pass while it has any, so a
+        // tail rings out), then its own level and pan, into the output.
+        for (id, bus) in self.buses.iter_mut() {
+            if !bus.fed && bus.effects.is_empty() {
+                continue;
+            }
+            for effect in &mut bus.effects {
+                // A failing effect lets the bus through as it is, never silence.
+                let _ = effect.apply(&mut bus.buffer, bus.channels);
+            }
+            let ramp = self.gains.get_mut(id);
+            let weights = self.weights.get_mut(id);
+            for (offset, sample) in bus.buffer.iter().enumerate() {
+                let absolute = from + offset;
+                let mut gain = ramp.as_deref().map_or(1.0, |ramp| ramp.at(absolute));
+                if let Some(weights) = weights.as_deref() {
+                    gain *= weights.at(absolute);
+                }
+                let sample = if gain == 1.0 { *sample } else { S::from_f32(sample.to_f32() * gain) };
+                let slot = &mut self.mix[offset];
+                *slot = slot.mix(sample);
+            }
+            if let Some(ramp) = ramp {
+                ramp.seen = to;
+            }
+            if let Some(weights) = weights {
+                weights.seen = to;
             }
         }
 
@@ -372,6 +550,8 @@ impl<S: SampleType> Mixer<S> {
             }
             ramp.to != 1.0 && to.saturating_sub(ramp.seen) < MAX_SCHEDULE_AHEAD
         });
+        self.weights.retain(|_, weights| !weights.unity(to) && to.saturating_sub(weights.seen) < MAX_SCHEDULE_AHEAD);
+        self.sends.retain(|_, (_, seen)| to.saturating_sub(*seen) < MAX_SCHEDULE_AHEAD);
 
         self.voices.retain(|_, segments| !segments.is_empty());
     }
@@ -395,9 +575,10 @@ impl<S: SampleType> Mixer<S> {
         let slot = Arc::clone(&self.master);
         let mut master = slot.lock().unwrap_or_else(PoisonError::into_inner);
         let mut ready = self.output.vacant_len();
-        // An output effect takes whole frames: what does not fill one waits a pass.
-        if let Some((_, channels)) = master.as_ref() {
-            let channels = usize::from((*channels).max(1));
+        // An effect takes whole frames: what does not fill one waits a pass.
+        let frame = master.as_ref().map(|(_, channels)| *channels).or_else(|| self.buses.values().find(|bus| !bus.effects.is_empty()).map(|bus| bus.channels));
+        if let Some(channels) = frame {
+            let channels = usize::from(channels.max(1));
             ready -= ready % channels;
         }
         if ready == 0 {
@@ -439,11 +620,36 @@ impl<S: SampleType> Mixer<S> {
         for voice in self.cancels.take() {
             self.voices.remove(&voice);
             self.gains.remove(&voice);
+            self.weights.remove(&voice);
+            self.sends.remove(&voice);
+            self.buses.remove(&voice);
             worked = true;
         }
 
         for change in self.cancels.take_gains() {
             self.apply_gain(change);
+            worked = true;
+        }
+        for change in take_all(&self.cancels.levels) {
+            self.apply_levels(change);
+            worked = true;
+        }
+        for (voice, bus) in take_all(&self.cancels.sends) {
+            match bus {
+                Some(bus) => {
+                    self.buses.entry(bus).or_insert_with(|| Bus::new(1));
+                    self.sends.insert(voice, (bus, self.cursor));
+                }
+                None => {
+                    self.sends.remove(&voice);
+                }
+            }
+            worked = true;
+        }
+        for (bus, effects, channels) in take_all(&self.cancels.effects) {
+            let entry = self.buses.entry(bus).or_insert_with(|| Bus::new(channels));
+            entry.effects = effects;
+            entry.channels = channels;
             worked = true;
         }
 

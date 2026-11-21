@@ -8,6 +8,22 @@ underneath it, so **Done** always holds exactly what is unreleased.
 
 **Done**
 
+## Release 0.8.15
+
+- **Per-channel levels on a voice: pan in the mixer.** `Scheduler::set_levels(voice,
+  &levels, over)` weighs each output channel of a voice by its own level, ramped,
+  on top of `set_gain`. Done at commit like the gain, so a pan move is heard within
+  a buffer however far ahead the voice is scheduled.
+- **Buses.** `Scheduler::new_bus()` gives a bus id; `send(voice, Some(bus))` mixes
+  a voice into it instead of the output. A bus sums its voices apart, runs its
+  effects (`set_bus_effects`), then its own `set_gain` and `set_levels`, and goes
+  into the output. `cancel(bus)` removes it; its voices go straight to the output.
+  One level: a bus does not go into another bus. A stop keeps a bus's level and pan.
+- **VST3 host.** The host the plugin talks to: its context, a component handler
+  for edits made in the plugin's own window, the frame its view sits in, and the
+  messages between processor and controller. Parameter edits wait for the next
+  processed block.
+
 ## Release 0.8.14
 
 - **An effect on a whole output.** `OutputClass::set_master_effect(Some(plugin))`

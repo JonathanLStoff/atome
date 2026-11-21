@@ -57,18 +57,22 @@ use std::ptr;
 use vst3::Steinberg::Vst::{
     AudioBusBuffers, AudioBusBuffers__type0, Event, Event_::EventTypes_, Event__type0,
     IAudioProcessor, IAudioProcessorTrait, IComponent, IComponentTrait, IConnectionPoint,
-    IConnectionPointTrait, IEditController, IEditControllerTrait, IEventList, IEventListTrait,
-    IParameterChanges, NoteOffEvent, NoteOnEvent, ParameterInfo as Vst3ParameterInfo,
+    IComponentHandler, IComponentHandlerTrait, IConnectionPointTrait, IEditController,
+    IAttributeList, IAttributeListTrait, IEditControllerTrait, IEventList, IEventListTrait,
+    IHostApplication, IHostApplicationTrait, IMessage, IMessageTrait,
+    IParamValueQueue, IParamValueQueueTrait, IParameterChanges, IParameterChangesTrait, ParamID,
+    ParamValue, String128, NoteOffEvent, NoteOnEvent, ParameterInfo as Vst3ParameterInfo,
     ParameterInfo_::ParameterFlags_, PolyPressureEvent, ProcessContext as Vst3ProcessContext,
     ProcessContext_::StatesAndFlags_, ProcessData, ProcessModes_, ProcessSetup,
     SymbolicSampleSizes_, ViewType,
 };
 use vst3::Steinberg::{
-    IBStream, IBStreamTrait, IPlugView, IPlugViewTrait, IPluginBaseTrait, IPluginFactory,
+    IBStream, IBStreamTrait, IPlugFrame, IPlugFrameTrait, IPlugView, IPlugViewTrait, IPluginBaseTrait, IPluginFactory,
     IPluginFactoryTrait, PClassInfo, PClassInfo_, TUID, ViewRect, kPlatformTypeHWND,
-    kPlatformTypeNSView, kPlatformTypeX11EmbedWindowID, kResultOk, kResultTrue,
+    kPlatformTypeNSView, kPlatformTypeX11EmbedWindowID, kNoInterface, kNotImplemented, kResultFalse, kResultOk,
+    kResultTrue,
 };
-use vst3::{Class, ComPtr, ComWrapper};
+use vst3::{Class, ComPtr, ComRef, ComWrapper, Interface};
 
 /// Format identifier used on returned [`PluginInfo`].
 pub const FORMAT: &str = "vst3";
@@ -590,6 +594,10 @@ pub struct Vst3Plugin {
     view: Option<ComPtr<IPlugView>>,
     editor_open: bool,
 
+    /// atome: the host side the plugin talks to (its context, the component handler its window
+    /// reports edits through, and the frame its view sits in).
+    host: ComWrapper<Host>,
+
     // atome: hold the module open for the lifetime of the instance, and drop it last: fields drop
     // in order, and the COM pointers above must be released while the library is still loaded.
     _module: LoadedModule,
@@ -615,10 +623,11 @@ impl Vst3Plugin {
             })?;
         let component = component_ptr;
 
-        // Initialize the component. Many plugins accept a NULL
-        // context (hosts only need to supply IHostApplication for
-        // plugins that look it up via queryInterface).
-        if unsafe { component.initialize(ptr::null_mut()) } != kResultOk {
+        // Initialize the component with the host's context (atome: some plugins, Native
+        // Instruments' among them, crash on a NULL one).
+        let host = ComWrapper::new(Host::default());
+        let context = host.as_com_ref::<IHostApplication>().map_or(ptr::null_mut(), |host| host.as_ptr().cast());
+        if unsafe { component.initialize(context) } != kResultOk {
             return Err(Error::LoadFailed {
                 path: info.path.clone(),
                 reason: "IComponent::initialize returned non-OK".into(),
@@ -645,7 +654,7 @@ impl Vst3Plugin {
                     path: info.path.clone(),
                     reason: "factory.createInstance(IEditController) returned NULL".into(),
                 })?;
-            if unsafe { ctrl_ptr.initialize(ptr::null_mut()) } != kResultOk {
+            if unsafe { ctrl_ptr.initialize(context) } != kResultOk {
                 return Err(Error::LoadFailed {
                     path: info.path.clone(),
                     reason: "IEditController::initialize returned non-OK".into(),
@@ -687,6 +696,11 @@ impl Vst3Plugin {
             (None, None)
         };
 
+        // Edits made in the plugin's own window come back through the component handler.
+        if let Some(handler) = host.as_com_ref::<IComponentHandler>() {
+            unsafe { controller.setComponentHandler(handler.as_ptr()) };
+        }
+
         let param_count_raw = unsafe { controller.getParameterCount() }.max(0);
         #[allow(clippy::cast_sign_loss)]
         let param_count = param_count_raw as usize;
@@ -713,6 +727,7 @@ impl Vst3Plugin {
             processing: false,
             view: None,
             editor_open: false,
+            host,
         })
     }
 }
@@ -844,6 +859,8 @@ impl PluginCore for Vst3Plugin {
                 "IEditController::setParamNormalized failed".into(),
             ));
         }
+        // atome: the processor hears it from the next block.
+        self.host.edit(info.id, clamped);
         Ok(())
     }
 
@@ -889,6 +906,9 @@ impl PluginCore for Vst3Plugin {
                 "IComponent::setState returned {status}"
             )));
         }
+        // atome: the controller (and so the plugin's window) shows the restored values.
+        stream.position.set(0);
+        let _ = unsafe { self.controller.setComponentState(stream_ptr.as_ptr()) };
         Ok(())
     }
 
@@ -904,6 +924,13 @@ impl PluginCore for Vst3Plugin {
             self.processor
                 .setBusArrangements(&raw mut input_arr, 1, &raw mut output_arr, 1)
         };
+        // atome: the main audio buses on, as the SDK asks of a host (some plugins crash
+        // processing a bus that is off). Best-effort: a plugin with no input bus says no.
+        unsafe {
+            use vst3::Steinberg::Vst::{BusDirections_, MediaTypes_};
+            self.component.activateBus(MediaTypes_::kAudio as i32, BusDirections_::kInput as i32, 0, 1);
+            self.component.activateBus(MediaTypes_::kAudio as i32, BusDirections_::kOutput as i32, 0, 1);
+        }
 
         let mut setup = ProcessSetup {
             #[allow(clippy::cast_possible_wrap)]
@@ -921,10 +948,13 @@ impl PluginCore for Vst3Plugin {
         if unsafe { self.component.setActive(1) } != kResultOk {
             return Err(Error::Other("IComponent::setActive(true) failed".into()));
         }
-        if unsafe { self.processor.setProcessing(1) } != kResultOk {
-            return Err(Error::Other(
-                "IAudioProcessor::setProcessing(true) failed".into(),
-            ));
+        // atome: the SDK lets a plugin answer kNotImplemented here (iZotope's do); only a real
+        // failure stops the load.
+        let status = unsafe { self.processor.setProcessing(1) };
+        if status != kResultOk && status != kNotImplemented {
+            return Err(Error::Other(format!(
+                "IAudioProcessor::setProcessing(true) returned {status}"
+            )));
         }
         self.processing = true;
         self.active_layout = Some(layout);
@@ -970,10 +1000,14 @@ impl truce_rack_core::editor::PluginEditor for Vst3Plugin {
                 "IPlugView::isPlatformTypeSupported returned false".into(),
             ));
         }
-        if unsafe { view.attached(parent_ptr, type_str) } != kResultOk {
-            return Err(Error::Other("IPlugView::attached returned non-OK".into()));
+        // atome: plugins resize through the frame, some while they attach.
+        if let Some(frame) = self.host.as_com_ref::<IPlugFrame>() {
+            unsafe { view.setFrame(frame.as_ptr()) };
         }
-        self.view = Some(view);
+        if unsafe { view.attached(parent_ptr, type_str) } != kResultOk {
+            unsafe { view.setFrame(ptr::null_mut()) };
+            return Err(Error::Other("IPlugView::attached returned non-OK".into()));
+        }        self.view = Some(view);
         self.editor_open = true;
         Ok(())
     }
@@ -981,6 +1015,7 @@ impl truce_rack_core::editor::PluginEditor for Vst3Plugin {
     fn close(&mut self) {
         if let Some(view) = self.view.take() {
             unsafe { view.removed() };
+            unsafe { view.setFrame(ptr::null_mut()) };
         }
         self.editor_open = false;
     }
@@ -1172,6 +1207,10 @@ impl Plugin<f32> for Vst3Plugin {
             .to_com_ptr::<IEventList>()
             .ok_or_else(|| Error::Other("EventList3 missing IEventList IID".into()))?;
 
+        // atome: edits since the last block (the plugin's window, set_parameter), at its start.
+        let changes = self.host.take_changes();
+        let changes_ptr = changes.as_ref().and_then(|changes| changes.to_com_ptr::<IParameterChanges>());
+
         let main_inputs = buffer.main_inputs();
         let mut input_ptrs: Vec<*mut f32> =
             main_inputs.iter().map(|c| c.as_ptr().cast_mut()).collect();
@@ -1210,7 +1249,7 @@ impl Plugin<f32> for Vst3Plugin {
             numOutputs: 1,
             inputs: &raw mut input_bus,
             outputs: &raw mut output_bus,
-            inputParameterChanges: ptr::null_mut::<IParameterChanges>(),
+            inputParameterChanges: changes_ptr.as_ref().map_or(ptr::null_mut(), ComPtr::as_ptr),
             outputParameterChanges: ptr::null_mut::<IParameterChanges>(),
             inputEvents: input_events_ptr.as_ptr(),
             outputEvents: output_events_ptr.as_ptr(),
@@ -1470,6 +1509,305 @@ impl IBStreamTrait for MemoryStream {
         }
         unsafe {
             *pos = self.position.get() as i64;
+        }
+        kResultOk
+    }
+}
+
+// ---------------------------------------------------------------------------
+// atome: the host side a plugin talks to.
+// ---------------------------------------------------------------------------
+
+/// The host's context, component handler and plugin frame, in one object. Parameter edits (from
+/// the plugin's window, or `set_parameter`) wait here for the next processed block.
+#[derive(Default)]
+struct Host {
+    edits: std::sync::Mutex<Vec<(ParamID, ParamValue)>>,
+}
+
+impl Class for Host {
+    type Interfaces = (IHostApplication, IComponentHandler, IPlugFrame);
+}
+
+impl Host {
+    fn edit(&self, id: ParamID, value: ParamValue) {
+        if let Ok(mut edits) = self.edits.lock() {
+            match edits.iter_mut().find(|(edited, _)| *edited == id) {
+                Some(edit) => edit.1 = value,
+                None => edits.push((id, value)),
+            }
+        }
+    }
+
+    /// The edits waiting, as the processor's input changes; `None` when there are none.
+    fn take_changes(&self) -> Option<ComWrapper<ParamChanges>> {
+        let edits = std::mem::take(&mut *self.edits.lock().ok()?);
+        if edits.is_empty() {
+            return None;
+        }
+        let queues = edits
+            .into_iter()
+            .filter_map(|(id, value)| ComWrapper::new(ParamQueue { id, value }).to_com_ptr::<IParamValueQueue>())
+            .collect();
+        Some(ComWrapper::new(ParamChanges { queues }))
+    }
+}
+
+impl IHostApplicationTrait for Host {
+    unsafe fn getName(&self, name: *mut String128) -> i32 {
+        if name.is_null() {
+            return kResultFalse;
+        }
+        let name = unsafe { &mut *name };
+        name.fill(0);
+        for (slot, unit) in name.iter_mut().zip("atome".encode_utf16()) {
+            *slot = unit;
+        }
+        kResultOk
+    }
+
+    // The messages a plugin's processor and controller send each other through their connection
+    // points are made by the host (atome: as the SDK's own host does; plugins whose controller is
+    // separate need them).
+    unsafe fn createInstance(&self, cid: *mut TUID, _iid: *mut TUID, obj: *mut *mut std::ffi::c_void) -> i32 {
+        if obj.is_null() {
+            return kResultFalse;
+        }
+        let cid: &[u8] = if cid.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(cid.cast::<u8>(), 16) } };
+        let made = if cid == IMessage::IID {
+            ComWrapper::new(Message::default()).to_com_ptr::<IMessage>().map(|message| message.into_raw().cast())
+        } else if cid == IAttributeList::IID {
+            ComWrapper::new(Attributes::default()).to_com_ptr::<IAttributeList>().map(|list| list.into_raw().cast())
+        } else {
+            None
+        };
+        unsafe { *obj = made.unwrap_or(ptr::null_mut()) };
+        if made.is_some() { kResultOk } else { kNoInterface }
+    }
+}
+
+impl IComponentHandlerTrait for Host {
+    unsafe fn beginEdit(&self, _id: ParamID) -> i32 {
+        kResultOk
+    }
+
+    unsafe fn performEdit(&self, id: ParamID, value: ParamValue) -> i32 {
+        self.edit(id, value);
+        kResultOk
+    }
+
+    unsafe fn endEdit(&self, _id: ParamID) -> i32 {
+        kResultOk
+    }
+
+    unsafe fn restartComponent(&self, _flags: i32) -> i32 {
+        kResultOk
+    }
+}
+
+impl IPlugFrameTrait for Host {
+    // shortcut: the view takes the new size but the host's window does not follow it; make the
+    // window follow (an editor callback to the host) when a plugin that resizes needs it.
+    unsafe fn resizeView(&self, view: *mut IPlugView, size: *mut ViewRect) -> i32 {
+        match unsafe { ComRef::from_raw(view) } {
+            Some(view) if !size.is_null() => unsafe { view.onSize(size) },
+            _ => kResultFalse,
+        }
+    }
+}
+
+/// One parameter's change for a block: a single point at its start.
+struct ParamQueue {
+    id: ParamID,
+    value: ParamValue,
+}
+
+impl Class for ParamQueue {
+    type Interfaces = (IParamValueQueue,);
+}
+
+impl IParamValueQueueTrait for ParamQueue {
+    unsafe fn getParameterId(&self) -> ParamID {
+        self.id
+    }
+
+    unsafe fn getPointCount(&self) -> i32 {
+        1
+    }
+
+    unsafe fn getPoint(&self, index: i32, offset: *mut i32, value: *mut ParamValue) -> i32 {
+        if index != 0 || offset.is_null() || value.is_null() {
+            return kResultFalse;
+        }
+        unsafe {
+            *offset = 0;
+            *value = self.value;
+        }
+        kResultOk
+    }
+
+    unsafe fn addPoint(&self, _offset: i32, _value: ParamValue, _index: *mut i32) -> i32 {
+        kResultFalse
+    }
+}
+
+/// A block's parameter changes.
+struct ParamChanges {
+    queues: Vec<ComPtr<IParamValueQueue>>,
+}
+
+impl Class for ParamChanges {
+    type Interfaces = (IParameterChanges,);
+}
+
+impl IParameterChangesTrait for ParamChanges {
+    unsafe fn getParameterCount(&self) -> i32 {
+        i32::try_from(self.queues.len()).unwrap_or(i32::MAX)
+    }
+
+    unsafe fn getParameterData(&self, index: i32) -> *mut IParamValueQueue {
+        usize::try_from(index).ok().and_then(|index| self.queues.get(index)).map_or(ptr::null_mut(), ComPtr::as_ptr)
+    }
+
+    unsafe fn addParameterData(&self, _id: *const ParamID, _index: *mut i32) -> *mut IParamValueQueue {
+        ptr::null_mut()
+    }
+}
+
+/// A message between a plugin's processor and controller (`IHostApplication::createInstance`).
+struct Message {
+    id: std::cell::RefCell<std::ffi::CString>,
+    attributes: ComWrapper<Attributes>,
+}
+
+impl Default for Message {
+    fn default() -> Self {
+        Self { id: std::cell::RefCell::new(std::ffi::CString::default()), attributes: ComWrapper::new(Attributes::default()) }
+    }
+}
+
+impl Class for Message {
+    type Interfaces = (IMessage,);
+}
+
+impl IMessageTrait for Message {
+    unsafe fn getMessageID(&self) -> *const std::ffi::c_char {
+        self.id.borrow().as_ptr()
+    }
+
+    unsafe fn setMessageID(&self, id: *const std::ffi::c_char) {
+        if !id.is_null() {
+            *self.id.borrow_mut() = unsafe { std::ffi::CStr::from_ptr(id) }.to_owned();
+        }
+    }
+
+    unsafe fn getAttributes(&self) -> *mut IAttributeList {
+        // Borrowed, as the SDK's: the message keeps it.
+        self.attributes.as_com_ref::<IAttributeList>().map_or(ptr::null_mut(), |list| list.as_ptr())
+    }
+}
+
+enum Attribute {
+    Int(i64),
+    Float(f64),
+    Text(Vec<u16>),
+    Binary(Vec<u8>),
+}
+
+/// The values a message carries, by name.
+#[derive(Default)]
+struct Attributes {
+    values: std::cell::RefCell<std::collections::HashMap<Vec<u8>, Attribute>>,
+}
+
+impl Class for Attributes {
+    type Interfaces = (IAttributeList,);
+}
+
+fn attribute_key(id: *const std::ffi::c_char) -> Option<Vec<u8>> {
+    (!id.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(id) }.to_bytes().to_vec())
+}
+
+impl Attributes {
+    fn set(&self, id: *const std::ffi::c_char, value: Attribute) -> i32 {
+        let Some(key) = attribute_key(id) else { return kResultFalse };
+        self.values.borrow_mut().insert(key, value);
+        kResultOk
+    }
+}
+
+impl IAttributeListTrait for Attributes {
+    unsafe fn setInt(&self, id: *const std::ffi::c_char, value: i64) -> i32 {
+        self.set(id, Attribute::Int(value))
+    }
+
+    unsafe fn getInt(&self, id: *const std::ffi::c_char, value: *mut i64) -> i32 {
+        match attribute_key(id).and_then(|key| match self.values.borrow().get(&key) { Some(Attribute::Int(found)) => Some(*found), _ => None }) {
+            Some(found) if !value.is_null() => {
+                unsafe { *value = found };
+                kResultOk
+            }
+            _ => kResultFalse,
+        }
+    }
+
+    unsafe fn setFloat(&self, id: *const std::ffi::c_char, value: f64) -> i32 {
+        self.set(id, Attribute::Float(value))
+    }
+
+    unsafe fn getFloat(&self, id: *const std::ffi::c_char, value: *mut f64) -> i32 {
+        match attribute_key(id).and_then(|key| match self.values.borrow().get(&key) { Some(Attribute::Float(found)) => Some(*found), _ => None }) {
+            Some(found) if !value.is_null() => {
+                unsafe { *value = found };
+                kResultOk
+            }
+            _ => kResultFalse,
+        }
+    }
+
+    unsafe fn setString(&self, id: *const std::ffi::c_char, string: *const u16) -> i32 {
+        if string.is_null() {
+            return kResultFalse;
+        }
+        let mut text = Vec::new();
+        let mut at = string;
+        while unsafe { *at } != 0 {
+            text.push(unsafe { *at });
+            at = unsafe { at.add(1) };
+        }
+        self.set(id, Attribute::Text(text))
+    }
+
+    unsafe fn getString(&self, id: *const std::ffi::c_char, string: *mut u16, size_in_bytes: u32) -> i32 {
+        let values = self.values.borrow();
+        let Some(Attribute::Text(text)) = attribute_key(id).and_then(|key| values.get(&key)) else { return kResultFalse };
+        let room = (size_in_bytes as usize / 2).saturating_sub(1);
+        if string.is_null() || size_in_bytes < 2 {
+            return kResultFalse;
+        }
+        let count = text.len().min(room);
+        unsafe {
+            std::ptr::copy_nonoverlapping(text.as_ptr(), string, count);
+            *string.add(count) = 0;
+        }
+        kResultOk
+    }
+
+    unsafe fn setBinary(&self, id: *const std::ffi::c_char, data: *const std::ffi::c_void, size_in_bytes: u32) -> i32 {
+        let bytes = if data.is_null() { Vec::new() } else { unsafe { std::slice::from_raw_parts(data.cast::<u8>(), size_in_bytes as usize) }.to_vec() };
+        self.set(id, Attribute::Binary(bytes))
+    }
+
+    unsafe fn getBinary(&self, id: *const std::ffi::c_char, data: *mut *const std::ffi::c_void, size_in_bytes: *mut u32) -> i32 {
+        let values = self.values.borrow();
+        let Some(Attribute::Binary(bytes)) = attribute_key(id).and_then(|key| values.get(&key)) else { return kResultFalse };
+        if data.is_null() || size_in_bytes.is_null() {
+            return kResultFalse;
+        }
+        // Points into the list, valid while the value is not set again (as the SDK's).
+        unsafe {
+            *data = bytes.as_ptr().cast();
+            *size_in_bytes = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
         }
         kResultOk
     }

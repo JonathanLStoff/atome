@@ -14,7 +14,7 @@ use cpal::{Error, ErrorKind};
 use ringbuf::traits::Producer;
 use ringbuf::HeapProd;
 
-use super::{resample_into, GainChange, MixCommand, OutputClass, PlayClock, SampleType, Voices};
+use super::{resample_into, GainChange, LevelsChange, MixCommand, OutputClass, PlayClock, SampleType, Voices};
 
 /// Voice ids are unique in the process, so two schedulers never share one.
 static NEXT_VOICE: AtomicU64 = AtomicU64::new(1);
@@ -108,6 +108,35 @@ impl<S: SampleType> Scheduler<S> {
     /// [`cancel`](Self::cancel) would: a stop that does not click.
     pub fn fade_out(&self, voice: u64, over: Duration) {
         self.voices.gain(self.change(voice, 0.0, over, true));
+    }
+
+    /// Weighs each channel of `voice` (or a bus) by `levels`, one linear level
+    /// per output channel, over `over`: a pan, heard within a buffer as
+    /// [`set_gain`](Self::set_gain) is, and on top of it.
+    pub fn set_levels(&self, voice: u64, levels: &[f32], over: Duration) {
+        let channels = usize::from(self.channels.max(1));
+        let frames = (over.as_secs_f64() * f64::from(self.sample_rate)).round() as usize;
+        self.voices.levels(LevelsChange { voice, levels: levels.to_vec(), samples: frames * channels, channels });
+    }
+
+    /// A bus id: voices [`send`](Self::send) to it are summed apart, run
+    /// through its [`effects`](Self::set_bus_effects), and brought to its own
+    /// [`set_gain`](Self::set_gain) and [`set_levels`](Self::set_levels).
+    pub fn new_bus(&self) -> u64 {
+        self.new_voice()
+    }
+
+    /// Sends `voice` through `bus`, or (`None`) straight to the output. Send
+    /// before scheduling the voice.
+    pub fn send(&self, voice: u64, bus: Option<u64>) {
+        self.voices.send(voice, bus);
+    }
+
+    /// Runs `effects` in order on everything `bus` sums, at this output's
+    /// channel count; an empty list takes them off. [`cancel`](Self::cancel)
+    /// on the bus removes it.
+    pub fn set_bus_effects(&self, bus: u64, effects: Vec<crate::plugins::Plugin>) {
+        self.voices.bus_effects(bus, effects, self.channels);
     }
 
     fn change(&self, voice: u64, gain: f32, over: Duration, then_cancel: bool) -> GainChange {
