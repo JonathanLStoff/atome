@@ -27,7 +27,7 @@ use super::types::SampleType;
 use ringbuf::traits::{Consumer, Observer, Producer};
 use ringbuf::{HeapCons, HeapProd};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -211,6 +211,8 @@ pub struct Mixer<S: SampleType> {
     cancels: Arc<Voices>,
     /// The level of each voice that is not simply as scheduled.
     gains: HashMap<u64, Ramp>,
+    /// Passes run so far ([`MixerHandle::passes`]).
+    passes: Arc<AtomicU64>,
 }
 
 impl<S: SampleType> Mixer<S> {
@@ -227,6 +229,7 @@ impl<S: SampleType> Mixer<S> {
             voices: HashMap::new(),
             cancels: Arc::new(Voices::default()),
             gains: HashMap::new(),
+            passes: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -441,7 +444,14 @@ impl<S: SampleType> Mixer<S> {
             if !self.tick() {
                 thread::sleep(IDLE_POLL);
             }
+            self.passes.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// How many passes this mixer has run, counted as it runs: one that stops
+    /// rising has stopped mixing, though the stream keeps padding with silence.
+    pub fn passes(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.passes)
     }
 
     /// Absolute index of the next sample the mixer will commit.
@@ -465,6 +475,7 @@ pub struct MixerHandle {
     running: Arc<AtomicBool>,
     clear: Arc<ClearSignal>,
     voices: Arc<Voices>,
+    passes: Arc<AtomicU64>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -475,6 +486,7 @@ impl MixerHandle {
         let flag = Arc::clone(&running);
         let clear = mixer.clear_signal();
         let voices = mixer.voices();
+        let passes = mixer.passes();
 
         let thread = thread::Builder::new()
             .name("atome_mixer".to_string())
@@ -485,8 +497,22 @@ impl MixerHandle {
             running,
             clear,
             voices,
+            passes,
             thread: Some(thread),
         }
+    }
+
+    /// Whether the mixer thread is still running. A thread that panicked or
+    /// returned is not, and nothing more will be heard from this output: the
+    /// stream keeps playing silence, so its clock alone cannot tell.
+    pub fn is_alive(&self) -> bool {
+        self.running.load(Ordering::Relaxed) && self.thread.as_ref().is_some_and(|thread| !thread.is_finished())
+    }
+
+    /// Passes the mixer has run. A watchdog that sees it stand still while
+    /// [`is_alive`](Self::is_alive) holds has a mixer that is stuck, not dead.
+    pub fn passes(&self) -> u64 {
+        self.passes.load(Ordering::Relaxed)
     }
 
     /// Drops everything scheduled but not yet played, on both sides of the

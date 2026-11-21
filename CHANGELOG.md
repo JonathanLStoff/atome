@@ -8,6 +8,17 @@ underneath it, so **Done** always holds exactly what is unreleased.
 
 **Done**
 
+## Release 0.8.13
+
+- **Reverb quality.** `reverb` takes `quality` (default 1): under 0.5 it runs
+  four combs into two all-passes instead of eight into four, about half the
+  work, with each comb taking more of the input so the tail is as loud. For
+  phones, where the reverb is the one heavy effect.
+- **A dead mixer is seen.** `MixerHandle::is_alive()` says whether the mixer
+  thread still runs (one that panicked or returned does not; the stream pads
+  with silence, so the clock alone cannot tell), and `MixerHandle::passes()`
+  counts its passes, so a watchdog that sees it stand still has a stuck one.
+
 ## Release 0.8.12
 
 - **Plugin windows and state.** `Plugin::editor()` hands out a hosted

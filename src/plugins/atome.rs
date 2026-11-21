@@ -1568,10 +1568,12 @@ parameters! {
         mix: 0.3, 0.0, 1.0, "", "0 is dry, 1 is tail only";
         width: 1.0, 0.0, 1.0, "", "how far apart the channels' tails are";
         pre_delay_ms: 0.0, 0.0, 200.0, "ms", "gap before the tail starts";
+        quality: 1.0, 0.0, 1.0, "", "1 is full; under 0.5 is light: half the filters, for phones";
     }
 }
 
-/// Eight comb filters into four all-passes, per channel.
+/// Eight comb filters into four all-passes, per channel; four into two when
+/// `quality` is under 0.5 (light: about half the work, a thinner tail).
 ///
 /// The Schroeder arrangement, in the proportions Freeverb uses: the combs build
 /// density and the all-passes smear what is left of the pattern. The comb
@@ -1589,6 +1591,8 @@ pub struct ReverbEffect {
 struct ReverbChannel {
     combs: Vec<Comb>,
     allpasses: Vec<AllPass>,
+    /// Built light (`quality` under 0.5): rebuilt when that changes.
+    light: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1631,7 +1635,7 @@ impl ReverbEffect {
     ///
     /// Free of `self` so it can be called while the channel slots are borrowed
     /// mutably, which is where it is needed.
-    fn build_channel(sample_rate: u32, channel: usize) -> ReverbChannel {
+    fn build_channel(sample_rate: u32, channel: usize, light: bool) -> ReverbChannel {
         let scale = sample_rate as f32 / 44_100.0;
         let offset = channel * STEREO_SPREAD;
 
@@ -1639,9 +1643,13 @@ impl ReverbEffect {
             (((base + offset) as f32) * scale).round().max(1.0) as usize
         };
 
+        // Light keeps every other comb, spread across the lengths, and the
+        // first two all-passes.
+        let combs = COMB_LENGTHS.iter().step_by(if light { 2 } else { 1 });
+        let allpasses = &ALLPASS_LENGTHS[..if light { 2 } else { ALLPASS_LENGTHS.len() }];
         ReverbChannel {
-            combs: COMB_LENGTHS
-                .iter()
+            light,
+            combs: combs
                 .map(|base| {
                     let length = sized(*base);
                     Comb {
@@ -1651,7 +1659,7 @@ impl ReverbEffect {
                     }
                 })
                 .collect(),
-            allpasses: ALLPASS_LENGTHS
+            allpasses: allpasses
                 .iter()
                 .map(|base| {
                     let length = sized(*base);
@@ -1688,9 +1696,10 @@ impl Effect for ReverbEffect {
         {
             let sample_rate = self.sample_rate;
             let slots = self.channels.get(channel_count);
+            let light = params.quality < 0.5;
             for (channel, slot) in slots.iter_mut().enumerate() {
-                if slot.combs.is_empty() {
-                    *slot = Self::build_channel(sample_rate, channel);
+                if slot.combs.is_empty() || slot.light != light {
+                    *slot = Self::build_channel(sample_rate, channel, light);
                 }
             }
         }
@@ -1716,14 +1725,16 @@ impl Effect for ReverbEffect {
 
                 let state = &mut self.channels.slots[index];
 
-                // Combs in parallel, summed.
+                // Combs in parallel, summed; fewer of them (light) each take
+                // more input, so the tail is as loud.
+                let send = 0.015 * COMB_LENGTHS.len() as f32 / state.combs.len().max(1) as f32;
                 let mut tail = 0.0;
                 for comb in state.combs.iter_mut() {
                     let delayed = comb.line.read(comb.length as f32);
                     // One-pole low-pass in the feedback path: each time round
                     // the loop the high end loses a little more.
                     comb.filtered = delayed * (1.0 - damping) + comb.filtered * damping;
-                    comb.line.push(input * 0.015 + comb.filtered * feedback);
+                    comb.line.push(input * send + comb.filtered * feedback);
                     tail += delayed;
                 }
 
