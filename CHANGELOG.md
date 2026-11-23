@@ -8,6 +8,17 @@ underneath it, so **Done** always holds exactly what is unreleased.
 
 **Done**
 
+## Release 0.8.16
+
+- **A VST3 gets a buffer for every audio bus it declares.** The host passed one input
+  and one output bus whatever the plugin had, so a plugin with a sidechain (iZotope
+  VocalSynth 2) or with no input at all (an instrument: Massive X) read past them and
+  crashed on its first block. Sidechains now get silence, extra outputs are dropped,
+  and an instrument gets no input bus.
+- **`scan::vst3_bundle(path)`** lists the plugins of one VST3 bundle, and a bundle
+  without `moduleinfo.json` now says which are instruments (its sub-categories,
+  through `IPluginFactory2`).
+
 ## Release 0.8.15
 
 - **Per-channel levels on a voice: pan in the mixer.** `Scheduler::set_levels(voice,

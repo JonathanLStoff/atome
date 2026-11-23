@@ -97,31 +97,43 @@ pub fn vst3(folders: &[PathBuf]) -> (Vec<Found>, Vec<Failed>) {
             if !bundle.to_string_lossy().ends_with(".vst3") {
                 continue;
             }
-            if let Some(listed) = module_info(&bundle) {
-                found.extend(listed);
-                continue;
-            }
-            match super::vst3_host::scan_bundle(&bundle) {
-                Ok(listed) if !listed.is_empty() => {
-                    found.extend(listed.into_iter().map(|info| Found {
-                        kind: kind_from_name(&info.name),
-                        name: info.name,
-                        vendor: info.vendor,
-                        format: PluginFormat::Vst3,
-                        id: info.unique_id,
-                        path: bundle.clone(),
-                        instrument: false,
-                    }))
-                }
-                Ok(_) => failed.push(Failed {
-                    path: bundle,
-                    reason: "no audio plugin in the bundle, or it would not load".into(),
-                }),
-                Err(error) => failed.push(Failed { path: bundle, reason: error.to_string() }),
+            match vst3_bundle(&bundle) {
+                Ok(listed) => found.extend(listed),
+                Err(reason) => failed.push(Failed { path: bundle, reason }),
             }
         }
     }
     (found, failed)
+}
+
+#[cfg(feature = "vst3")]
+/// The plugins in the one VST3 `bundle`, with whether each is an instrument: from its
+/// `moduleinfo.json` if it has one, else by loading the module (run that in a helper process if a
+/// bad plugin must not take the caller down).
+///
+/// # Errors
+///
+/// The bundle holds no audio plugin, or will not load.
+pub fn vst3_bundle(bundle: &std::path::Path) -> Result<Vec<Found>, String> {
+    if let Some(listed) = module_info(bundle) {
+        return Ok(listed);
+    }
+    match super::vst3_host::scan_bundle(bundle) {
+        Ok(listed) if !listed.is_empty() => Ok(listed
+            .into_iter()
+            .map(|info| Found {
+                kind: kind_from_name(&info.name),
+                instrument: matches!(info.category, truce_rack_core::info::PluginCategory::Instrument),
+                name: info.name,
+                vendor: info.vendor,
+                format: PluginFormat::Vst3,
+                id: info.unique_id,
+                path: bundle.to_path_buf(),
+            })
+            .collect()),
+        Ok(_) => Err("no audio plugin in the bundle, or it would not load".into()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// What a bundle's `moduleinfo.json` lists, or `None` without one.

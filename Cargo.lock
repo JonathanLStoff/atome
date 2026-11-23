@@ -48,7 +48,7 @@ dependencies = [
 
 [[package]]
 name = "atome"
-version = "0.8.15"
+version = "0.8.16"
 dependencies = [
  "atomic-queue",
  "block2",

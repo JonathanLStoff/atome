@@ -206,11 +206,18 @@ fn scan_bundle_into(bundle: &Path, out: &mut Vec<PluginInfo>) -> Result<()> {
             continue;
         }
         let name = char8_array_to_string(&info.name);
+        // atome: an instrument says so in its sub-categories (IPluginFactory2), e.g. "Instrument|Synth".
+        let instrument = factory.cast::<vst3::Steinberg::IPluginFactory2>().is_some_and(|factory2| {
+            use vst3::Steinberg::IPluginFactory2Trait;
+            let mut info2: vst3::Steinberg::PClassInfo2 = unsafe { std::mem::zeroed() };
+            (unsafe { factory2.getClassInfo2(idx, &raw mut info2) }) == kResultOk
+                && char8_array_to_string(&info2.subCategories).split('|').any(|sub| sub == "Instrument")
+        });
         out.push(PluginInfo {
             name,
             vendor: String::new(),
             version: 0,
-            category: PluginCategory::Effect,
+            category: if instrument { PluginCategory::Instrument } else { PluginCategory::Effect },
             path: bundle.to_path_buf(),
             unique_id: tuid_to_hex(&info.cid),
             format: FORMAT,
@@ -594,6 +601,15 @@ pub struct Vst3Plugin {
     view: Option<ComPtr<IPlugView>>,
     editor_open: bool,
 
+    /// atome: the plugin's audio buses past the main one (sidechains, extra outputs), by channel
+    /// count, and whether it has a main input at all (an instrument has none). Every bus gets a
+    /// buffer in `process`: a plugin reads the buffers of each bus it declares.
+    has_main_input: bool,
+    aux_inputs: Vec<usize>,
+    aux_outputs: Vec<usize>,
+    /// Silence for the extra input buses, and somewhere for the extra outputs to go.
+    aux_scratch: Vec<f32>,
+
     /// atome: the host side the plugin talks to (its context, the component handler its window
     /// reports edits through, and the frame its view sits in).
     host: ComWrapper<Host>,
@@ -727,6 +743,10 @@ impl Vst3Plugin {
             processing: false,
             view: None,
             editor_open: false,
+            has_main_input: true,
+            aux_inputs: Vec::new(),
+            aux_outputs: Vec::new(),
+            aux_scratch: Vec::new(),
             host,
         })
     }
@@ -930,6 +950,29 @@ impl PluginCore for Vst3Plugin {
             use vst3::Steinberg::Vst::{BusDirections_, MediaTypes_};
             self.component.activateBus(MediaTypes_::kAudio as i32, BusDirections_::kInput as i32, 0, 1);
             self.component.activateBus(MediaTypes_::kAudio as i32, BusDirections_::kOutput as i32, 0, 1);
+        }
+
+        // atome: what the plugin's audio buses are now, so `process` hands it one buffer each.
+        let channels_of = |direction: i32| -> Vec<usize> {
+            use vst3::Steinberg::Vst::{BusInfo, MediaTypes_};
+            let count = unsafe { self.component.getBusCount(MediaTypes_::kAudio as i32, direction) }.max(0);
+            (0..count)
+                .map(|index| {
+                    let mut info: BusInfo = unsafe { std::mem::zeroed() };
+                    let ok = unsafe { self.component.getBusInfo(MediaTypes_::kAudio as i32, direction, index, &raw mut info) } == kResultOk;
+                    if ok { usize::try_from(info.channelCount).unwrap_or(0) } else { 0 }
+                })
+                .collect()
+        };
+        {
+            use vst3::Steinberg::Vst::BusDirections_;
+            let inputs = channels_of(BusDirections_::kInput as i32);
+            let outputs = channels_of(BusDirections_::kOutput as i32);
+            self.has_main_input = !inputs.is_empty();
+            self.aux_inputs = inputs.into_iter().skip(1).collect();
+            self.aux_outputs = outputs.into_iter().skip(1).collect();
+            let aux_channels: usize = self.aux_inputs.iter().chain(&self.aux_outputs).sum();
+            self.aux_scratch = vec![0.0; aux_channels * max_block_size];
         }
 
         let mut setup = ProcessSetup {
@@ -1211,27 +1254,52 @@ impl Plugin<f32> for Vst3Plugin {
         let changes = self.host.take_changes();
         let changes_ptr = changes.as_ref().and_then(|changes| changes.to_com_ptr::<IParameterChanges>());
 
+        // atome: one AudioBusBuffers per audio bus the plugin declares (a plugin reads each one):
+        // the main bus carries the audio, sidechains get silence, extra outputs are dropped. An
+        // instrument has no input bus at all.
         let main_inputs = buffer.main_inputs();
-        let mut input_ptrs: Vec<*mut f32> =
+        let mut main_input_ptrs: Vec<*mut f32> =
             main_inputs.iter().map(|c| c.as_ptr().cast_mut()).collect();
-        let mut input_bus = AudioBusBuffers {
-            numChannels: i32::try_from(input_ptrs.len()).unwrap_or(0),
-            silenceFlags: 0,
-            __field0: AudioBusBuffers__type0 {
-                channelBuffers32: input_ptrs.as_mut_ptr(),
-            },
-        };
-
         let main_outputs = buffer.main_outputs();
-        let mut output_ptrs: Vec<*mut f32> =
+        let mut main_output_ptrs: Vec<*mut f32> =
             main_outputs.iter_mut().map(|c| c.as_mut_ptr()).collect();
-        let mut output_bus = AudioBusBuffers {
-            numChannels: i32::try_from(output_ptrs.len()).unwrap_or(0),
-            silenceFlags: 0,
-            __field0: AudioBusBuffers__type0 {
-                channelBuffers32: output_ptrs.as_mut_ptr(),
-            },
+        let stride = if self.aux_inputs.is_empty() && self.aux_outputs.is_empty() {
+            0
+        } else {
+            self.aux_scratch.len() / (self.aux_inputs.iter().chain(&self.aux_outputs).sum::<usize>()).max(1)
         };
+        if stride < frames && stride != 0 {
+            return Err(Error::Other("a block is longer than the plugin was set up for".into()));
+        }
+        // Inputs' silence first: an earlier block's outputs may have left sound in the shared scratch.
+        let aux_in_len: usize = self.aux_inputs.iter().sum::<usize>() * stride;
+        self.aux_scratch[..aux_in_len].fill(0.0);
+        let scratch = self.aux_scratch.as_mut_ptr();
+        let mut next = 0usize;
+        let mut aux_ptrs = |channels: usize| -> Vec<*mut f32> {
+            (0..channels)
+                .map(|_| {
+                    // SAFETY: `next` stays inside `aux_scratch`, sized for every aux channel × stride.
+                    let channel = unsafe { scratch.add(next * stride) };
+                    next += 1;
+                    channel
+                })
+                .collect()
+        };
+        let mut input_ptrs: Vec<Vec<*mut f32>> = Vec::new();
+        if self.has_main_input {
+            input_ptrs.push(std::mem::take(&mut main_input_ptrs));
+        }
+        input_ptrs.extend(self.aux_inputs.clone().into_iter().map(&mut aux_ptrs));
+        let mut output_ptrs: Vec<Vec<*mut f32>> = vec![std::mem::take(&mut main_output_ptrs)];
+        output_ptrs.extend(self.aux_outputs.clone().into_iter().map(&mut aux_ptrs));
+        let bus = |ptrs: &mut Vec<*mut f32>| AudioBusBuffers {
+            numChannels: i32::try_from(ptrs.len()).unwrap_or(0),
+            silenceFlags: 0,
+            __field0: AudioBusBuffers__type0 { channelBuffers32: ptrs.as_mut_ptr() },
+        };
+        let mut input_buses: Vec<AudioBusBuffers> = input_ptrs.iter_mut().map(bus).collect();
+        let mut output_buses: Vec<AudioBusBuffers> = output_ptrs.iter_mut().map(bus).collect();
 
         // Build the transport context up front so its backing
         // struct outlives the process call.
@@ -1245,10 +1313,10 @@ impl Plugin<f32> for Vst3Plugin {
             #[allow(clippy::cast_possible_wrap)]
             symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
             numSamples: i32::try_from(frames).unwrap_or(i32::MAX),
-            numInputs: 1,
-            numOutputs: 1,
-            inputs: &raw mut input_bus,
-            outputs: &raw mut output_bus,
+            numInputs: i32::try_from(input_buses.len()).unwrap_or(0),
+            numOutputs: i32::try_from(output_buses.len()).unwrap_or(0),
+            inputs: if input_buses.is_empty() { ptr::null_mut() } else { input_buses.as_mut_ptr() },
+            outputs: output_buses.as_mut_ptr(),
             inputParameterChanges: changes_ptr.as_ref().map_or(ptr::null_mut(), ComPtr::as_ptr),
             outputParameterChanges: ptr::null_mut::<IParameterChanges>(),
             inputEvents: input_events_ptr.as_ptr(),
