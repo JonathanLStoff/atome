@@ -181,7 +181,11 @@ mod backend {
         pending_at: Option<u64>,
         sample_rate: u32,
         channels: u16,
+        /// The track's length in frames at `declared_rate`, as the container counts it.
         total_frames: Option<u64>,
+        /// The rate the container declares, which `total_frames` counts at: HE-AAC's is half
+        /// what it decodes to ([`frames_at`]).
+        declared_rate: Option<u32>,
         /// What the file itself is coded in, as opposed to `S`. Taken from the
         /// header, so it is the convention-based reading rather than the one a
         /// decoded packet would confirm.
@@ -205,8 +209,21 @@ mod backend {
         /// whole number of frames: counting frames would lose the remainder on
         /// every odd-sized read and let the limit drift.
         emitted: u64,
-        /// Total samples the track declares, if it declares any.
-        limit: Option<u64>,
+    }
+
+    /// A track's length of `frames` counted at `declared` Hz, at the `rate` it decodes to.
+    ///
+    /// The same unless the decoder makes more of it than the container says: HE-AAC (an
+    /// audiobook's usual format) declares its core rate, 22 050 Hz, and decodes to 44 100 Hz with
+    /// its high band put back. Counted at the core rate, a 30 s track stopped after 15 s.
+    pub(super) fn frames_at(frames: Option<u64>, declared: Option<u32>, rate: u32) -> Option<u64> {
+        let frames = frames?;
+        match declared {
+            Some(declared) if declared != 0 && declared != rate => {
+                Some((u128::from(frames) * u128::from(rate) / u128::from(declared)) as u64)
+            }
+            _ => Some(frames),
+        }
     }
 
     /// Everything opening a file produces, before any audio is decoded.
@@ -219,6 +236,7 @@ mod backend {
         sample_rate: u32,
         channels: u16,
         total_frames: Option<u64>,
+        declared_rate: Option<u32>,
         /// Bits per sample as the container declares them, which is the only
         /// reliable statement of the file's width.
         bits: Option<u32>,
@@ -294,6 +312,8 @@ mod backend {
             .map(|channels| channels.count())
             .ok_or_else(|| unreadable(path, "no channel count"))?;
 
+        let declared_rate = params.sample_rate;
+
         // `sample_format` is left unset by every decoder tried here, so the
         // bit depth is what there is to go on.
         let bits = decoded.bits_per_sample.or(params.bits_per_sample);
@@ -306,6 +326,7 @@ mod backend {
             sample_rate,
             channels: channels as u16,
             total_frames,
+            declared_rate,
             bits,
         })
     }
@@ -380,14 +401,21 @@ mod backend {
             sample_rate,
             channels,
             total_frames,
+            declared_rate,
             bits,
         } = open_parts(path)?;
 
-        let limit = total_frames.map(|frames| frames.saturating_mul(channels.max(1) as u64));
+        // At the rate the decoder settles on, which it may only name after a packet.
+        let limit_now = |decoder: &dyn AudioDecoder| {
+            let rate = decoder.codec_params().sample_rate.unwrap_or(sample_rate);
+            let channels = decoder.codec_params().channels.as_ref().map_or(channels, |channels| channels.count() as u16);
+            frames_at(total_frames, declared_rate, rate).map(|frames| frames.saturating_mul(u64::from(channels.max(1))))
+        };
         let mut collected: Option<Samples> = None;
         let mut emitted = 0u64;
 
         loop {
+            let limit = limit_now(decoder.as_ref());
             if matches!(limit, Some(limit) if emitted >= limit) {
                 break;
             }
@@ -416,7 +444,7 @@ mod backend {
             let samples = collected.get_or_insert_with(|| {
                 empty_for(native_format(bits, Some(buffer_kind(&buffer))))
             });
-            let room = limit.map(|limit| (limit - emitted) as usize);
+            let room = limit.map(|limit| limit.saturating_sub(emitted) as usize);
             emitted += append(samples, &buffer, room) as u64;
         }
 
@@ -512,6 +540,7 @@ mod backend {
                 sample_rate,
                 channels,
                 total_frames,
+                declared_rate,
                 bits,
             } = opened;
 
@@ -524,12 +553,12 @@ mod backend {
                 sample_rate,
                 channels,
                 total_frames,
+                declared_rate,
                 source_format: native_format(bits, None),
                 pending: Vec::new(),
                 scratch: Vec::new(),
                 taken: 0,
                 emitted: 0,
-                limit: total_frames.map(|frames| frames.saturating_mul(channels.max(1) as u64)),
             }
         }
 
@@ -618,7 +647,7 @@ mod backend {
         fn seek(&mut self, frame: u64) -> Result<u64, Error> {
             let channels = u64::from(AudioStream::<S>::channels(self).max(1));
             let rate = f64::from(AudioStream::<S>::sample_rate(self).max(1));
-            let frame = self.total_frames.map_or(frame, |total| frame.min(total));
+            let frame = AudioStream::<S>::total_frames(self).map_or(frame, |total| frame.min(total));
 
             // Asked for `frame`, a container can still land a packet late (on
             // a block boundary, by rounding): then it is asked again from
@@ -685,7 +714,7 @@ mod backend {
         }
 
         fn total_frames(&self) -> Option<u64> {
-            self.total_frames
+            frames_at(self.total_frames, self.declared_rate, AudioStream::<S>::sample_rate(self))
         }
 
         fn source_format(&self) -> SampleFormat {
@@ -701,7 +730,9 @@ mod backend {
             // This only ever trims. Where a container over-declares — Ogg Opus
             // counts the frames it will pre-skip — the limit sits above what
             // the decoder produces and nothing is cut.
-            let remaining = match self.limit {
+            let limit = AudioStream::<S>::total_frames(self)
+                .map(|frames| frames.saturating_mul(u64::from(AudioStream::<S>::channels(self).max(1))));
+            let remaining = match limit {
                 Some(limit) if self.emitted >= limit => return Ok(0),
                 Some(limit) => Some(limit - self.emitted),
                 None => None,
@@ -1208,4 +1239,18 @@ pub(super) fn decode_amr_wb(path: &Path) -> Result<Decoded, Error> {
     let _ = path;
 
     Err(no_decoder("AMR-WB decoding"))
+}
+
+#[cfg(all(test, feature = "import"))]
+mod he_aac_length {
+    use super::backend::frames_at;
+
+    #[test]
+    fn a_track_counted_at_its_core_rate_is_counted_again_at_the_rate_it_decodes_to() {
+        // HE-AAC: the container counts 30 s at 22 050 Hz, the decoder gives 44 100 Hz.
+        assert_eq!(frames_at(Some(661_500), Some(22_050), 44_100), Some(1_323_000));
+        assert_eq!(frames_at(Some(661_500), Some(44_100), 44_100), Some(661_500));
+        assert_eq!(frames_at(Some(661_500), None, 44_100), Some(661_500));
+        assert_eq!(frames_at(None, Some(22_050), 44_100), None);
+    }
 }

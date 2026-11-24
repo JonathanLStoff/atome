@@ -8,6 +8,15 @@ underneath it, so **Done** always holds exactly what is unreleased.
 
 **Done**
 
+## Release 0.8.18
+
+- **HE-AAC plays to its end.** An MP4 counts an HE-AAC track's length at its core rate
+  (22 050 Hz) while it decodes at twice that, so a stream stopped halfway: a 30-second
+  file came out as 15 seconds. The length is now counted at the rate it decodes to.
+- **A decoder's overshoot past full scale is clipped when writing FLAC**, not refused.
+  An AAC file whose samples peaked above 1.0 failed to convert with "input sample must
+  be in the range of bits=24".
+
 ## Release 0.8.17
 
 - **FLAC export never writes a frame larger than its samples stored plain.** flacenc

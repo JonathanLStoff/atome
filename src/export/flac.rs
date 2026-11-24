@@ -40,6 +40,10 @@ const MAX_CHANNELS: u16 = 8;
 /// per channel.
 const CHUNK_FRAMES: usize = 4096;
 
+/// The range a 24-bit sample can hold.
+const I24_MIN: i32 = -(1 << 23);
+const I24_MAX: i32 = (1 << 23) - 1;
+
 /// What a finished FLAC file holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FlacSummary {
@@ -514,7 +518,7 @@ fn write_decoded<W: Write + Seek>(
         Samples::U16(samples) => write_as!(samples, |&sample| i32::from(sample) - 32_768),
         Samples::I16(samples) => write_as!(samples, |&sample| i32::from(sample)),
         Samples::U24(samples) => write_as!(samples, |&sample: &U24| sample.inner() - (1 << 23)),
-        Samples::I24(samples) => write_as!(samples, |&sample: &I24| sample.inner()),
+        Samples::I24(samples) => write_as!(samples, |&sample: &I24| sample.inner().clamp(I24_MIN, I24_MAX)),
         // The bottom eight bits go: below the noise floor of anything that
         // was ever recorded, and the most FLAC's encoder here will take.
         Samples::U32(samples) => write_as!(samples, |&sample| ((sample ^ 0x8000_0000) as i32) >> 8),
@@ -601,7 +605,9 @@ fn convert<W: Write + Seek>(
         pump(stream, open, 16, i32::from)
     } else {
         let stream = import::stream_as::<I24>(input, encoding)?;
-        pump(stream, open, 24, |sample: I24| sample.inner())
+        // Clipped to 24 bits: a decoder's overshoot past full scale (AAC's, often) is carried
+        // in the I24's wider integer, and the encoder refuses the whole file over one sample.
+        pump(stream, open, 24, |sample: I24| sample.inner().clamp(I24_MIN, I24_MAX))
     }
 }
 

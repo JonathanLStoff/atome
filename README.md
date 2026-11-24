@@ -57,7 +57,7 @@ be expected until `1.0`.
 
 ```toml
 [dependencies]
-atome = "0.8.17"
+atome = "0.8.18"
 ```
 
 Every feature is off by default. Decoding audio files needs `import`, and
@@ -65,7 +65,7 @@ hosting plugins needs the feature for that format:
 
 ```toml
 [dependencies]
-atome = { version = "0.8.17", features = ["import", "vst3", "au3"] }
+atome = { version = "0.8.18", features = ["import", "vst3", "au3"] }
 ```
 
 ## Quick start

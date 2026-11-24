@@ -257,3 +257,40 @@ fn a_refused_stream_is_refused_before_the_writer_is_touched() {
     assert!(FlacWriter::new(&mut sink, 48_000, 2, 7).is_err());
     assert_eq!(sink.into_inner(), vec![7_u8; 10]);
 }
+
+/// A 32-bit float WAV of `samples`, interleaved stereo at 44.1 kHz.
+fn float_wav(path: &Path, samples: &[f32]) {
+    let data: Vec<u8> = samples.iter().flat_map(|sample| sample.to_le_bytes()).collect();
+    let mut file = std::fs::File::create(path).unwrap();
+    let (channels, rate, bits) = (2u16, 44_100u32, 32u16);
+    file.write_all(b"RIFF").unwrap();
+    file.write_all(&(36 + data.len() as u32).to_le_bytes()).unwrap();
+    file.write_all(b"WAVEfmt ").unwrap();
+    file.write_all(&16u32.to_le_bytes()).unwrap();
+    file.write_all(&3u16.to_le_bytes()).unwrap(); // IEEE float
+    file.write_all(&channels.to_le_bytes()).unwrap();
+    file.write_all(&rate.to_le_bytes()).unwrap();
+    file.write_all(&(rate * u32::from(channels) * u32::from(bits / 8)).to_le_bytes()).unwrap();
+    file.write_all(&(channels * bits / 8).to_le_bytes()).unwrap();
+    file.write_all(&bits.to_le_bytes()).unwrap();
+    file.write_all(b"data").unwrap();
+    file.write_all(&(data.len() as u32).to_le_bytes()).unwrap();
+    file.write_all(&data).unwrap();
+}
+
+/// Decoders overshoot full scale (AAC often does); converting such a file used to fail outright
+/// with "input sample must be in the range of bits=24". It is clipped instead.
+#[test]
+fn a_float_source_past_full_scale_is_clipped_not_refused() {
+    let wav = Scratch::new("overshoot.wav");
+    let flac = Scratch::new("overshoot.flac");
+    let samples: Vec<f32> = (0..10_000).flat_map(|frame| { let v = (frame as f32 * 0.05).sin() * 1.5; [v, -v] }).collect();
+    float_wav(&wav.0, &samples);
+
+    let summary = to_flac(&wav.0, &flac.0).unwrap();
+    assert_eq!(summary.frames, 10_000);
+    let back = import::decode(&flac.0).unwrap();
+    let Samples::I24(back) = back.samples else { panic!("24-bit back") };
+    let peak = back.iter().map(|sample| sample.inner()).max().unwrap();
+    assert_eq!(peak, 8_388_607, "clipped at full scale");
+}
