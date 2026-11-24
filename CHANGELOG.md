@@ -8,6 +8,15 @@ underneath it, so **Done** always holds exactly what is unreleased.
 
 **Done**
 
+## Release 0.8.17
+
+- **FLAC export never writes a frame larger than its samples stored plain.** flacenc
+  0.5's fixed predictors could pick a Rice parameter far too small for clipped 24-bit
+  audio (a loud MP3 decoded), writing residuals mostly in unary: a 20-minute MP3 became
+  a 4.5 GB FLAC and needed 3.5 GB of memory, enough for iOS to end the app. A block
+  that comes out larger than plain is encoded again without the fixed predictors, then
+  plain. The same MP3 now makes a 106 MB FLAC in 9 MB of memory.
+
 ## Release 0.8.16
 
 - **A VST3 gets a buffer for every audio bus it declares.** The host passed one input

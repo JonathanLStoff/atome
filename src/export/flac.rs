@@ -108,6 +108,9 @@ pub struct FlacWriter<W: Write + Seek = File> {
     /// Run once at the end: `sync_all` for a file the writer opened itself.
     settle: fn(&mut W) -> std::io::Result<()>,
     config: Verified<config::Encoder>,
+    /// Tried in turn on a block [`config`](FlacWriter::config) encoded larger than its samples
+    /// stored plain ([`Parts::fallbacks`]).
+    fallbacks: Vec<Verified<config::Encoder>>,
     stream: Stream,
     buffer: (FrameBuf, Context),
     /// Interleaved samples short of a whole block, waiting for the rest.
@@ -180,6 +183,7 @@ impl<W: Write + Seek> FlacWriter<W> {
     ) -> Result<Self, Error> {
         let Parts {
             config,
+            fallbacks,
             stream,
             buffer,
             header,
@@ -203,6 +207,7 @@ impl<W: Write + Seek> FlacWriter<W> {
             start,
             settle,
             config,
+            fallbacks,
             stream,
             buffer,
             pending: Vec::with_capacity(block_size * channels),
@@ -331,18 +336,26 @@ impl<W: Write + Seek> FlacWriter<W> {
 
         let number = self.buffer.1.current_frame_number().unwrap_or(0);
 
-        let frame = flacenc::encode_fixed_size_frame(
-            &self.config,
-            &self.buffer.0,
-            number,
-            self.stream.stream_info(),
-        )
-        .map_err(|error| {
-            invalid(format!(
-                "encoding FLAC frame {number}: {error} — are the samples within {} bits?",
-                self.bits_per_sample
-            ))
-        })?;
+        let encode_with = |config: &Verified<config::Encoder>| {
+            flacenc::encode_fixed_size_frame(config, &self.buffer.0, number, self.stream.stream_info())
+                .map_err(|error| {
+                    invalid(format!(
+                        "encoding FLAC frame {number}: {error} — are the samples within {} bits?",
+                        self.bits_per_sample
+                    ))
+                })
+        };
+
+        // A frame is never kept larger than its samples stored plain: see `Parts::fallbacks`.
+        // Measured before it is written, so an oversized one is never built in memory.
+        let plain = plain_frame_bits(interleaved.len() / self.channels, self.channels, self.bits_per_sample);
+        let mut frame = encode_with(&self.config)?;
+        for fallback in &self.fallbacks {
+            if frame.count_bits() <= plain {
+                break;
+            }
+            frame = encode_with(fallback)?;
+        }
 
         let mut sink = ByteSink::new();
         frame
@@ -366,6 +379,7 @@ impl<W: Write + Seek> FlacWriter<W> {
 /// Everything a writer needs that does not depend on where it writes.
 struct Parts {
     config: Verified<config::Encoder>,
+    fallbacks: Vec<Verified<config::Encoder>>,
     stream: Stream,
     buffer: (FrameBuf, Context),
     header: Vec<u8>,
@@ -376,6 +390,32 @@ struct Parts {
 }
 
 impl Parts {
+    /// What a block is encoded with again when `config` made it larger than its samples stored
+    /// plain: without the fixed predictors, then plain.
+    ///
+    /// flacenc 0.5's fixed predictors can pick a Rice parameter far too small for 24-bit audio
+    /// that clips (a loud MP3 decoded): every residual is then written mostly in unary, and one
+    /// frame of 4096 samples came to over a gigabyte. A 20-minute MP3 made a 4.5 GB FLAC and
+    /// several gigabytes of memory, enough for a phone to end the app.
+    fn fallbacks(config: &config::Encoder) -> Result<Vec<Verified<config::Encoder>>, Error> {
+        let mut no_fixed = config.clone();
+        no_fixed.subframe_coding.use_fixed = false;
+
+        let mut plain = config.clone();
+        plain.subframe_coding.use_constant = false;
+        plain.subframe_coding.use_fixed = false;
+        plain.subframe_coding.use_lpc = false;
+
+        [no_fixed, plain]
+            .into_iter()
+            .map(|config| {
+                config
+                    .into_verified()
+                    .map_err(|(_, error)| encoder_error("a fallback encoder configuration", error))
+            })
+            .collect()
+    }
+
     fn new(sample_rate: u32, channels: u16, bits_per_sample: u8) -> Result<Self, Error> {
         if !(1..=MAX_CHANNELS).contains(&channels) {
             return Err(invalid(format!(
@@ -391,6 +431,7 @@ impl Parts {
 
         let config = config::Encoder::default();
         let block_size = config.block_size;
+        let fallbacks = Parts::fallbacks(&config)?;
         let config = config
             .into_verified()
             .map_err(|(_, error)| encoder_error("the encoder configuration", error))?;
@@ -412,6 +453,7 @@ impl Parts {
 
         Ok(Parts {
             config,
+            fallbacks,
             stream,
             buffer,
             header,
@@ -598,6 +640,16 @@ fn pump<S: crate::output::SampleType, W: Write + Seek>(
     writer.finish()
 }
 
+/// The most a frame of `frames` samples a channel can take stored plain (VERBATIM): the
+/// largest frame header, each channel's subframe header and samples (a side channel carries one
+/// bit more), and the footer.
+fn plain_frame_bits(frames: usize, channels: usize, bits_per_sample: u8) -> usize {
+    const HEADER: usize = 16 * 8;
+    const SUBFRAME_HEADER: usize = 8;
+    const FOOTER: usize = 16;
+    HEADER + FOOTER + channels * (SUBFRAME_HEADER + frames * (usize::from(bits_per_sample) + 1))
+}
+
 /// The bit depth a set of samples needs in FLAC.
 fn bits_for(samples: &Samples) -> u8 {
     match samples {
@@ -675,5 +727,40 @@ mod tests {
 
         drop(writer);
         std::fs::remove_file(path).ok();
+    }
+}
+
+
+#[cfg(test)]
+mod oversized {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Interleaved stereo of a sine driven well past full scale and clipped, as a loud MP3
+    /// decodes: flacenc 0.5's fixed predictors coded it at four times its plain size.
+    fn clipped(frames: usize) -> Vec<i32> {
+        (0..frames * 2)
+            .map(|i| {
+                let t = (i / 2) as f64;
+                ((t * 0.3).sin() * 3.0).clamp(-1.0, 1.0).mul_add(8_388_607.0, 0.0) as i32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_block_never_comes_out_larger_than_its_samples_stored_plain() {
+        let samples = clipped(4096 * 4);
+        let mut writer = FlacWriter::new(Cursor::new(Vec::new()), 44_100, 2, 24).unwrap();
+        writer.write(&samples).unwrap();
+        let (summary, out) = writer.finish_into_inner().unwrap();
+
+        assert_eq!(summary.frames, 4096 * 4);
+        let plain = samples.len() * 3;
+        assert!(out.get_ref().len() <= plain + 4 * 64, "{} bytes for {plain} bytes of samples", out.get_ref().len());
+    }
+
+    #[test]
+    fn the_plain_bound_counts_a_side_channel_bit() {
+        assert_eq!(plain_frame_bits(4096, 2, 24), 128 + 16 + 2 * (8 + 4096 * 25));
     }
 }
