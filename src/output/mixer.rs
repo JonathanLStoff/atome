@@ -205,6 +205,33 @@ impl Weights {
     }
 }
 
+/// "Copy this voice's channels onto others of the same output, at this level":
+/// an aux send, taken after the voice's level (post-fader). `map` is
+/// `(from channel, to channel, gain)`; `None` takes the send off. With
+/// `follow_pan` the voice's per-channel levels ([`LevelsChange`]) apply too.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SendChange {
+    pub voice: u64,
+    /// The send's own id, so a voice can have several.
+    pub send: u64,
+    pub map: Option<Vec<(usize, usize, f32)>>,
+    /// Linear, ramped over `samples` like a [`GainChange`].
+    pub gain: f32,
+    pub samples: usize,
+    pub channels: usize,
+    pub follow_pan: bool,
+}
+
+/// One aux send of a voice, as the mixer runs it.
+#[derive(Clone, Debug)]
+struct Aux {
+    send: u64,
+    map: Vec<(usize, usize, f32)>,
+    ramp: Ramp,
+    follow_pan: bool,
+    channels: usize,
+}
+
 /// A submix: the voices sent to it are summed apart, run through its effects,
 /// brought to its own level and pan (a [`GainChange`] and [`LevelsChange`] on
 /// its id, as for a voice), and then summed into the output.
@@ -234,6 +261,8 @@ pub struct Voices {
     sends: Mutex<Vec<(u64, Option<u64>)>>,
     /// A bus's effects, and the channel count they run at.
     effects: Mutex<Vec<(u64, Vec<crate::plugins::Plugin>, u16)>>,
+    /// Aux sends set, changed or taken off.
+    aux: Mutex<Vec<SendChange>>,
 }
 
 fn take_all<T>(list: &Mutex<Vec<T>>) -> Vec<T> {
@@ -277,6 +306,12 @@ impl Voices {
     /// were mixed where the voice went then.
     pub fn send(&self, voice: u64, bus: Option<u64>) {
         self.sends.lock().unwrap_or_else(PoisonError::into_inner).push((voice, bus));
+    }
+
+    /// Sets, changes or (`map: None`) takes off one of a voice's aux sends.
+    /// Heard one buffer later.
+    pub fn aux_send(&self, change: SendChange) {
+        self.aux.lock().unwrap_or_else(PoisonError::into_inner).push(change);
     }
 
     /// Sets `bus`'s effects, run in order on its sum, `channels` wide (the
@@ -329,6 +364,10 @@ pub struct Mixer<S: SampleType> {
     /// last had samples waiting.
     sends: HashMap<u64, (u64, usize)>,
     buses: HashMap<u64, Bus<S>>,
+    /// Each voice's aux sends, and the cursor when it last had samples waiting.
+    aux: HashMap<u64, (Vec<Aux>, usize)>,
+    /// What the aux sends add this pass, summed into the output after the buses.
+    aux_mix: Vec<S>,
     /// How long a pass with nothing to do sleeps ([`idle_sleep`](Self::idle_sleep)).
     idle: Duration,
 }
@@ -353,6 +392,8 @@ impl<S: SampleType> Mixer<S> {
             weights: HashMap::new(),
             sends: HashMap::new(),
             buses: HashMap::new(),
+            aux: HashMap::new(),
+            aux_mix: Vec::new(),
         }
     }
 
@@ -386,6 +427,7 @@ impl<S: SampleType> Mixer<S> {
         self.mix.clear();
         self.voices.clear();
         self.sends.clear();
+        self.aux.clear();
         // A bus's level and pan are its settings, not something scheduled.
         // shortcut: a bus effect's tail (a reverb) still rings out after a stop; reset effects if that is heard.
         let buses = &self.buses;
@@ -417,6 +459,25 @@ impl<S: SampleType> Mixer<S> {
                 seen: self.cursor,
             },
         );
+    }
+
+    /// Sets, ramps or takes off one aux send of a voice.
+    fn apply_aux(&mut self, change: SendChange) {
+        let cursor = self.cursor;
+        let (sends, seen) = self.aux.entry(change.voice).or_insert_with(|| (Vec::new(), cursor));
+        *seen = cursor;
+        let Some(map) = change.map else {
+            sends.retain(|aux| aux.send != change.send);
+            return;
+        };
+        let from = sends.iter().find(|aux| aux.send == change.send).map_or(0.0, |aux| aux.ramp.at(cursor));
+        let to = if change.gain.is_finite() { change.gain.max(0.0) } else { 0.0 };
+        let ramp = Ramp { from, to, start: cursor, len: change.samples, channels: change.channels, then_cancel: false, seen: cursor };
+        let aux = Aux { send: change.send, map, ramp, follow_pan: change.follow_pan, channels: change.channels.max(1) };
+        match sends.iter_mut().find(|each| each.send == change.send) {
+            Some(each) => *each = aux,
+            None => sends.push(aux),
+        }
     }
 
     /// Sum one command into the accumulation buffer.
@@ -465,6 +526,8 @@ impl<S: SampleType> Mixer<S> {
     /// that are now wholly committed.
     fn commit_voices(&mut self, ready: usize) {
         let (from, to) = (self.cursor, self.cursor + ready);
+        self.aux_mix.clear();
+        self.aux_mix.resize(ready, S::SILENCE);
         for bus in self.buses.values_mut() {
             bus.buffer.clear();
             bus.buffer.resize(ready, S::SILENCE);
@@ -488,6 +551,35 @@ impl<S: SampleType> Mixer<S> {
             for (index, samples) in segments.iter() {
                 let (start, end) = (*index, index + samples.len());
                 let (low, high) = (start.max(from), end.min(to));
+
+                // Its aux sends: each channel copied onto others of this output, after
+                // the voice's level (and its pan, when the send follows it). Only whole
+                // frames are committed while a send is on (`flush`), so a target is in this pass.
+                if let Some((auxes, seen)) = self.aux.get_mut(voice) {
+                    *seen = to;
+                    for aux in auxes.iter() {
+                        for absolute in low..high {
+                            let channel = absolute % aux.channels;
+                            let mut gain = level.map_or(1.0, |ramp| ramp.at(absolute)) * aux.ramp.at(absolute);
+                            if aux.follow_pan {
+                                if let Some(weights) = weights.as_deref() {
+                                    gain *= weights.at(absolute);
+                                }
+                            }
+                            if gain == 0.0 {
+                                continue;
+                            }
+                            let sample = samples[absolute - start].to_f32() * gain;
+                            for &(source, target, weight) in &aux.map {
+                                let at = absolute - channel + target;
+                                if source == channel && target < aux.channels && (from..to).contains(&at) {
+                                    let slot = &mut self.aux_mix[at - from];
+                                    *slot = slot.mix(S::from_f32(sample * weight));
+                                }
+                            }
+                        }
+                    }
+                }
 
                 if level.is_none() && weights.is_none() {
                     for absolute in low..high {
@@ -551,6 +643,10 @@ impl<S: SampleType> Mixer<S> {
             }
         }
 
+        for (slot, sample) in self.mix[..ready].iter_mut().zip(&self.aux_mix) {
+            *slot = slot.mix(*sample);
+        }
+
         // A fade out that has run its course takes its voice with it; a ramp
         // that ended back at one, or whose voice played out long ago, is
         // forgotten.
@@ -567,6 +663,7 @@ impl<S: SampleType> Mixer<S> {
         });
         self.weights.retain(|_, weights| !weights.unity(to) && to.saturating_sub(weights.seen) < MAX_SCHEDULE_AHEAD);
         self.sends.retain(|_, (_, seen)| to.saturating_sub(*seen) < MAX_SCHEDULE_AHEAD);
+        self.aux.retain(|_, (sends, seen)| !sends.is_empty() && to.saturating_sub(*seen) < MAX_SCHEDULE_AHEAD);
 
         self.voices.retain(|_, segments| !segments.is_empty());
     }
@@ -591,7 +688,11 @@ impl<S: SampleType> Mixer<S> {
         let mut master = slot.lock().unwrap_or_else(PoisonError::into_inner);
         let mut ready = self.output.vacant_len();
         // An effect takes whole frames: what does not fill one waits a pass.
-        let frame = master.as_ref().map(|(_, channels)| *channels).or_else(|| self.buses.values().find(|bus| !bus.effects.is_empty()).map(|bus| bus.channels));
+        let frame = master
+            .as_ref()
+            .map(|(_, channels)| *channels)
+            .or_else(|| self.buses.values().find(|bus| !bus.effects.is_empty()).map(|bus| bus.channels))
+            .or_else(|| self.aux.values().flat_map(|(sends, _)| sends.first()).map(|aux| aux.channels as u16).next());
         if let Some(channels) = frame {
             let channels = usize::from(channels.max(1));
             ready -= ready % channels;
@@ -638,6 +739,11 @@ impl<S: SampleType> Mixer<S> {
             self.weights.remove(&voice);
             self.sends.remove(&voice);
             self.buses.remove(&voice);
+            self.aux.remove(&voice);
+            worked = true;
+        }
+        for change in take_all(&self.cancels.aux) {
+            self.apply_aux(change);
             worked = true;
         }
 

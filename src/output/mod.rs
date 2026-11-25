@@ -13,7 +13,7 @@ pub mod types;
 pub mod utils;
 
 pub use clock::PlayClock;
-pub use mixer::{ClearSignal, GainChange, LevelsChange, MixCommand, Mixer, MixerHandle, Voices};
+pub use mixer::{ClearSignal, GainChange, LevelsChange, MixCommand, Mixer, MixerHandle, SendChange, Voices};
 pub use scheduler::{Aligner, Scheduler};
 pub use types::{OutputType, SampleRate, SampleType};
 pub use utils::{

@@ -14,7 +14,7 @@ use cpal::{Error, ErrorKind};
 use ringbuf::traits::Producer;
 use ringbuf::HeapProd;
 
-use super::{resample_into, GainChange, LevelsChange, MixCommand, OutputClass, PlayClock, SampleType, Voices};
+use super::{resample_into, GainChange, LevelsChange, MixCommand, SendChange, OutputClass, PlayClock, SampleType, Voices};
 
 /// Voice ids are unique in the process, so two schedulers never share one.
 static NEXT_VOICE: AtomicU64 = AtomicU64::new(1);
@@ -137,6 +137,23 @@ impl<S: SampleType> Scheduler<S> {
     /// on the bus removes it.
     pub fn set_bus_effects(&self, bus: u64, effects: Vec<crate::plugins::Plugin>) {
         self.voices.bus_effects(bus, effects, self.channels);
+    }
+
+    /// Sets (or changes) aux send `send` of `voice`: each `(from, to, gain)` of
+    /// `map` copies the voice's output channel `from` onto channel `to`, at
+    /// `gain` (linear, ramped over `over`), after the voice's own level: a
+    /// post-fader send. With `follow_pan` the voice's [`set_levels`](Self::set_levels)
+    /// weigh it too. Heard within a buffer.
+    pub fn set_send(&self, voice: u64, send: u64, map: Vec<(usize, usize, f32)>, gain: f32, over: Duration, follow_pan: bool) {
+        let channels = usize::from(self.channels.max(1));
+        let frames = (over.as_secs_f64() * f64::from(self.sample_rate)).round() as usize;
+        self.voices.aux_send(SendChange { voice, send, map: Some(map), gain, samples: frames * channels, channels, follow_pan });
+    }
+
+    /// Takes aux send `send` off `voice`.
+    pub fn remove_send(&self, voice: u64, send: u64) {
+        let channels = usize::from(self.channels.max(1));
+        self.voices.aux_send(SendChange { voice, send, map: None, gain: 0.0, samples: 0, channels, follow_pan: false });
     }
 
     fn change(&self, voice: u64, gain: f32, over: Duration, then_cancel: bool) -> GainChange {

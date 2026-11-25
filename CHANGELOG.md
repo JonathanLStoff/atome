@@ -8,6 +8,16 @@ underneath it, so **Done** always holds exactly what is unreleased.
 
 **Done**
 
+## Release 0.8.20
+
+- **Aux sends: a voice's channels copied onto other channels of the same output,
+  post-fader** (`Scheduler::set_send`, `Scheduler::remove_send`, `SendChange`). Each
+  `(from, to, gain)` of a send's map copies output channel `from` onto `to` after the
+  voice's own level, and with `follow_pan` its per-channel levels too; the send's gain
+  ramps like a voice's and is heard within a buffer. A voice can have several, by id;
+  cancelling the voice takes them with it. While a send is on, the mixer commits whole
+  frames only, so a send never lands in a frame already handed to the device.
+
 ## Release 0.8.19
 
 - **An idle output's mixer sleeps a quarter of its buffer between passes**, between
