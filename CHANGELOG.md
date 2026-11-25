@@ -8,6 +8,14 @@ underneath it, so **Done** always holds exactly what is unreleased.
 
 **Done**
 
+## Release 0.8.19
+
+- **An idle output's mixer sleeps a quarter of its buffer between passes**, between
+  0.5 and 5 ms, instead of 0.5 ms always. With nothing to mix it woke about 2 000
+  times a second and took 5 % of a core on a phone; the ring it fills holds one
+  buffer, so it is still topped up at least four times a buffer
+  (`Mixer::idle_sleep`).
+
 ## Release 0.8.18
 
 - **HE-AAC plays to its end.** An MP4 counts an HE-AAC track's length at its core rate

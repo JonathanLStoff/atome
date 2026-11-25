@@ -32,8 +32,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-/// How long the mixer sleeps when a pass finds nothing to do.
+/// How long the mixer sleeps when a pass finds nothing to do, at the least.
 const IDLE_POLL: Duration = Duration::from_micros(500);
+/// And at the most, however long the output's buffer.
+const IDLE_MAX: Duration = Duration::from_millis(5);
 
 /// Furthest ahead of the play cursor a command may schedule samples, in samples.
 /// Caps how large the accumulation buffer can grow from a bad index.
@@ -327,11 +329,14 @@ pub struct Mixer<S: SampleType> {
     /// last had samples waiting.
     sends: HashMap<u64, (u64, usize)>,
     buses: HashMap<u64, Bus<S>>,
+    /// How long a pass with nothing to do sleeps ([`idle_sleep`](Self::idle_sleep)).
+    idle: Duration,
 }
 
 impl<S: SampleType> Mixer<S> {
     pub fn new(commands: HeapCons<MixCommand<S>>, output: HeapProd<S>) -> Self {
         Mixer {
+            idle: IDLE_POLL,
             commands,
             output,
             mix: Vec::new(),
@@ -349,6 +354,16 @@ impl<S: SampleType> Mixer<S> {
             sends: HashMap::new(),
             buses: HashMap::new(),
         }
+    }
+
+    /// Sleeps a quarter of `buffer` (the output's buffer time) when a pass has
+    /// nothing to do, within [`IDLE_POLL`] and [`IDLE_MAX`]: the ring holds one
+    /// buffer, so it is topped up at least four times a buffer and never runs
+    /// dry, while an idle output wakes the thread hundreds of times a second
+    /// instead of thousands.
+    pub fn idle_sleep(mut self, buffer: Duration) -> Self {
+        self.idle = (buffer / 4).clamp(IDLE_POLL, IDLE_MAX);
+        self
     }
 
     /// Where voices are cancelled, for handing to whoever schedules them.
@@ -665,7 +680,7 @@ impl<S: SampleType> Mixer<S> {
     pub fn run(mut self, running: Arc<AtomicBool>) {
         while running.load(Ordering::Relaxed) {
             if !self.tick() {
-                thread::sleep(IDLE_POLL);
+                thread::sleep(self.idle);
             }
             self.passes.fetch_add(1, Ordering::Relaxed);
         }

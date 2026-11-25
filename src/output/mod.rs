@@ -157,7 +157,8 @@ impl<S: SampleType> OutputClass<S> {
 
         // add_samples -> commands -> mixer -> audio ring buffer -> callback.
         let (commands, pending) = HeapRb::<MixCommand<S>>::new(COMMAND_QUEUE_LEN).split();
-        let mixer = MixerHandle::spawn(Mixer::new(pending, audio_producer));
+        let buffer = std::time::Duration::from_secs_f64(frames as f64 / f64::from((sample_rate as u32).max(1)));
+        let mixer = MixerHandle::spawn(Mixer::new(pending, audio_producer).idle_sleep(buffer));
 
         OutputClass {
             channels,
